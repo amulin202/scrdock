@@ -2,7 +2,7 @@
 rem Sync scrdock-mods (and master) with upstream scrcpy -- no PR involved.
 rem Usage: scrdock\sync-upstream.bat
 setlocal
-cd /d "%~dp0.."
+cd /d D:\Test\scrcpy
 
 echo [1/4] fetching upstream...
 git fetch upstream
