@@ -6,6 +6,9 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+permissions:
+  contents: write   # required for gh release create with GITHUB_TOKEN
+
 jobs:
   windows:
     runs-on: windows-latest
