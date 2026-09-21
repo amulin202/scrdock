@@ -1,0 +1,39 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (MSVC via build.bat)
+        shell: cmd
+        run: build.bat
+
+      - name: Package
+        shell: powershell
+        run: |
+          $zip = "scrdock-win64-$($env:GITHUB_SHA.Substring(0,7)).zip"
+          Compress-Archive -Path build\scrdock.exe, README.md -DestinationPath "build\$zip"
+          "zip=$zip" | Out-File -Append $env:GITHUB_ENV -Encoding ascii
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scrdock-win64
+          path: build/*.zip
+
+      - name: Create GitHub release (tag builds)
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "build/$ZIP" \
+            --title "scrdock $GITHUB_REF_NAME" \
+            --notes "scrcpy 悬浮工具栏（纯 C / Win32 单文件）。将 scrdock.exe 放到 scrcpy 所在目录运行即可：自动拉起/附着 scrcpy，边缘贴合停靠并实时跟随，提供 Home/返回/最近任务/电源/音量/通知栏/控制中心/截图/置顶开关等按钮。"
