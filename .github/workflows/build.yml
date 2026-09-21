@@ -20,11 +20,12 @@ jobs:
         run: build.bat
 
       - name: Package
-        shell: powershell
+        shell: bash
         run: |
-          $zip = "scrdock-win64-$($env:GITHUB_SHA.Substring(0,7)).zip"
-          Compress-Archive -Path build\scrdock.exe, README.md -DestinationPath "build\$zip"
-          "zip=$zip" | Out-File -Append $env:GITHUB_ENV -Encoding ascii
+          powershell -NoProfile -Command \
+            "Compress-Archive -Path build/scrdock.exe,README.md \
+             -DestinationPath build/scrdock-win64-${GITHUB_SHA:0:7}.zip"
+          ls build/
 
       - uses: actions/upload-artifact@v4
         with:
@@ -37,6 +38,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" "build/$ZIP" \
+          gh release create "$GITHUB_REF_NAME" build/scrdock-win64-*.zip \
             --title "scrdock $GITHUB_REF_NAME" \
             --notes "scrcpy 悬浮工具栏（纯 C / Win32 单文件）。将 scrdock.exe 放到 scrcpy 所在目录运行即可：自动拉起/附着 scrcpy，边缘贴合停靠并实时跟随，提供 Home/返回/最近任务/电源/音量/通知栏/控制中心/截图/置顶开关等按钮。"
