@@ -35,7 +35,7 @@ rc /nologo /fo "%OUT%\scrdock.res" scrdock.rc
 if errorlevel 1 exit /b 1
 cl /nologo /W4 /O2 /utf-8 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /D_CRT_SECURE_NO_WARNINGS /D_WIN32_WINNT=0x0A00 ^
    scrdock.c "%OUT%\scrdock.res" /Fe:"%OUT%\scrdock.exe" /Fo:"%OUT%/" ^
-   /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib kernel32.lib shell32.lib advapi32.lib
+   /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib kernel32.lib shell32.lib advapi32.lib comctl32.lib comdlg32.lib
 if errorlevel 1 exit /b 1
 
 rem ---- 2b. drop build intermediates (full rebuild every time anyway) ----

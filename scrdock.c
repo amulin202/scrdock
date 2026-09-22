@@ -12,6 +12,11 @@
  *   APP_SWITCH=187 (same mapping QtScrcpy uses).
  * - Screenshot: "adb exec-out screencap -p" redirected to a file on a worker
  *   thread (validated against the PNG magic, with a /sdcard + pull fallback).
+ * - Device tracking via a light "adb devices" poll (1.5 s, change-driven);
+ *   the manager window (设备/参数/路径 tabs) picks the target device, edits
+ *   options and paths, and shows scrcpy's stderr on failures. scrcpy is
+ *   always launched with -s <serial>; an unexpected disconnect (scrcpy exit
+ *   code 2) auto-reconnects once the device is back (bounded attempts).
  *
  * Build: see build.bat (cl /W4 /O2 /utf-8).
  */
@@ -43,14 +48,23 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+#include <commctrl.h>
+#include <commdlg.h>
 
-#define WM_APP_DEVREADY (WM_APP + 1)
-#define WM_APP_SHOTDONE (WM_APP + 2)
+#pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "comdlg32.lib")
+
+#define WM_APP_DEVLIST  (WM_APP + 1)  /* wp: struct DevList* (owned)   */
+#define WM_APP_DEVMETA  (WM_APP + 2)  /* wp: struct DevMetaBatch*      */
+#define WM_APP_SHOTDONE (WM_APP + 3)
+#define WM_APP_PROCEXIT (WM_APP + 4)  /* wp: exit code, lp: proc gen   */
+#define WM_APP_DETECTED (WM_APP + 5)  /* wp: heap wchar[] text         */
 
 #define TIMER_HUNT  1  /* 200 ms: poll for the scrcpy window            */
 #define TIMER_SYNC  2  /* 500 ms: safety net (missed events, pid polls) */
 #define TIMER_FLASH 3  /* 1.2 s: screenshot result flash                */
 #define TIMER_TIP   4  /* 350 ms: tooltip dwell delay                   */
+#define TIMER_RECONN 5 /* 1.5 s: one-shot reconnect delay               */
 
 #define IDM_REDOCK 100
 #define IDM_EXIT   101
@@ -66,7 +80,7 @@
 
 enum {
     ID_HOME, ID_BACK, ID_APPSW, ID_POWER, ID_VOLUP, ID_VOLDN,
-    ID_NOTIF, ID_CC, ID_PIN, ID_SHOT, ID_CLOSE, ID_COUNT
+    ID_NOTIF, ID_CC, ID_PIN, ID_SHOT, ID_MGR, ID_CLOSE, ID_COUNT
 };
 
 struct Btn {
@@ -86,20 +100,57 @@ static const struct Btn kBtns[ID_COUNT] = {
     { L"\uE713", L"CC",   L"展开控制中心" },
     { L"\uE718", L"PIN",  L"窗口置顶（scrcpy + 工具栏）" },
     { L"\uE722", L"SHOT", L"截图 Screenshot" },
+    { L"\uE712", L"···",  L"管理：设备 / 参数 / 路径" },
     { L"\uE8BB", L"X",    L"关闭（同时退出 scrcpy）" },
 };
 
-static const int kKeycode[ID_COUNT] = { 3, 4, 187, 26, 24, 25, 0, 0, 0, 0, 0 };
+static const int kKeycode[ID_COUNT] = { 3, 4, 187, 26, 24, 25, 0, 0, 0, 0, 0, 0 };
 
 /* scrcpy shortcut keys (MOD=lalt, pinned at launch; see launch_scrcpy). */
-static const WORD kVk[ID_COUNT] = { 'H', 'B', 'S', 'P', VK_UP, VK_DOWN, 'N', 0, 0, 0, 0 };
+static const WORD kVk[ID_COUNT] =
+    { 'H', 'B', 'S', 'P', VK_UP, VK_DOWN, 'N', 0, 0, 0, 0, 0 };
+
+#define DEV_MAX 8
+
+struct DevInfo {
+    wchar_t serial[64];
+    wchar_t state[16];       /* device / offline / unauthorized / ... */
+};
+
+struct DevList {
+    int count;
+    struct DevInfo v[DEV_MAX];
+};
+
+struct DevMeta {
+    wchar_t serial[64];
+    wchar_t model[64];
+    wchar_t android[16];
+    int battery;             /* percent, -1 = unknown */
+};
+
+struct DevMetaBatch {
+    int count;
+    int scrW, scrH;          /* wm size of the selected device (0 = skip) */
+    struct DevMeta v[DEV_MAX];
+};
 
 struct Config {
     wchar_t serial[128];
+    wchar_t scrcpy[MAX_PATH];   /* empty = auto-locate scrcpy.exe       */
     wchar_t scrcpy_args[512];
     wchar_t adb[MAX_PATH];
     BOOL close_on_exit;
     int control;             /* 0=auto 1=shortcut 2=adb */
+    int bitrate;             /* Mbps;  0 = scrcpy default               */
+    int max_size;            /* 0 = default                             */
+    int max_fps;             /* 0 = default                             */
+    BOOL turn_screen_off;
+    BOOL stay_awake;
+    BOOL no_audio;
+    BOOL show_touches;
+    BOOL auto_reconnect;
+    int reconnect_attempts;
 };
 
 struct Scrdock {
@@ -132,6 +183,21 @@ struct Scrdock {
     POINT mousePt;          /* last mouse position (screen coords)    */
     bool pinned_mod;        /* we launched scrcpy with --shortcut-mod=lalt */
     ULONGLONG launchTick;
+    /* manager + device tracking */
+    struct DevList *devList;    /* latest track-devices snapshot (owned)  */
+    struct DevMetaBatch devMeta;
+    bool metaBusy;
+    bool metaPending;
+    HANDLE hTrack;          /* device-poller thread handle              */
+    HANDLE trackStop;       /* manual-reset stop event for the poller   */
+    bool trackOn;           /* tracker thread started                   */
+    HANDLE hErr;            /* scrcpy stderr pipe, read end             */
+    char errBuf[4096];      /* rolling tail of scrcpy stderr (UTF-8)    */
+    unsigned procGen;       /* bumped per launch; tags stale PROCEXIT    */
+    bool reconnPending;
+    int reconnAttempts;
+    bool bootLaunch;        /* launch after the first DEVLIST (serial)  */
+    wchar_t errLine[256];   /* last ERROR line from scrcpy stderr       */
     wchar_t exeDir[MAX_PATH];
     wchar_t scrcpyPath[MAX_PATH];
     wchar_t adbPath[MAX_PATH];
@@ -145,6 +211,16 @@ struct Scrdock {
 
 static struct Scrdock g;
 static HINSTANCE g_hInst;
+
+/* forward declarations for cross-section calls (single translation unit) */
+static void hooks_install(DWORD pid);
+static void hooks_remove(void);
+static void hunting_start(void);
+static void err_drain(bool final);
+static void mgr_open(void);
+static void mgr_refresh(void);
+static void mgr_toggle(void);
+static void meta_spawn(void);
 
 /* ------------------------------------------------------------------ */
 /* small utilities                                                     */
@@ -232,10 +308,20 @@ static void ini_load(void)
     swprintf(ini, MAX_PATH, L"%s\\scrdock.ini", g.exeDir);
 
     g.cfg.serial[0] = L'\0';
+    g.cfg.scrcpy[0] = L'\0';
     g.cfg.scrcpy_args[0] = L'\0';
     g.cfg.adb[0] = L'\0';
     g.cfg.close_on_exit = TRUE;
     g.cfg.control = 0;
+    g.cfg.bitrate = 0;
+    g.cfg.max_size = 0;
+    g.cfg.max_fps = 0;
+    g.cfg.turn_screen_off = FALSE;
+    g.cfg.stay_awake = FALSE;
+    g.cfg.no_audio = FALSE;
+    g.cfg.show_touches = FALSE;
+    g.cfg.auto_reconnect = TRUE;
+    g.cfg.reconnect_attempts = 5;
 
     if (!file_exists(ini)) {
         return;
@@ -261,6 +347,75 @@ static void ini_load(void)
             g.cfg.control = 0;
         }
     }
+    GetPrivateProfileStringA("scrdock", "scrcpy", "", buf, sizeof(buf), ini_a);
+    MultiByteToWideChar(CP_ACP, 0, buf, -1, g.cfg.scrcpy, MAX_PATH);
+    g.cfg.bitrate = GetPrivateProfileIntA("scrdock", "bitrate", 0, ini_a);
+    g.cfg.max_size = GetPrivateProfileIntA("scrdock", "max_size", 0, ini_a);
+    g.cfg.max_fps = GetPrivateProfileIntA("scrdock", "max_fps", 0, ini_a);
+    g.cfg.turn_screen_off =
+        GetPrivateProfileIntA("scrdock", "turn_screen_off", 0, ini_a) != 0;
+    g.cfg.stay_awake =
+        GetPrivateProfileIntA("scrdock", "stay_awake", 0, ini_a) != 0;
+    g.cfg.no_audio =
+        GetPrivateProfileIntA("scrdock", "no_audio", 0, ini_a) != 0;
+    g.cfg.show_touches =
+        GetPrivateProfileIntA("scrdock", "show_touches", 0, ini_a) != 0;
+    g.cfg.auto_reconnect =
+        GetPrivateProfileIntA("scrdock", "auto_reconnect", 1, ini_a) != 0;
+    g.cfg.reconnect_attempts =
+        GetPrivateProfileIntA("scrdock", "reconnect_attempts", 5, ini_a);
+}
+
+/* Persist the config. Called on the UI thread only (manager buttons and
+ * device selection). Empty values remove the key, so a fresh ini keeps
+ * exactly the non-default settings. */
+static void ini_save(void)
+{
+    wchar_t ini[MAX_PATH];
+    char ini_a[MAX_PATH];
+    char val[1100];
+
+    swprintf(ini, MAX_PATH, L"%s\\scrdock.ini", g.exeDir);
+    WideCharToMultiByte(CP_ACP, 0, ini, -1, ini_a, MAX_PATH, NULL, NULL);
+
+    WideCharToMultiByte(CP_ACP, 0, g.cfg.serial, -1, val, 128, NULL, NULL);
+    WritePrivateProfileStringA("scrdock", "serial",
+                               g.cfg.serial[0] ? val : NULL, ini_a);
+    WideCharToMultiByte(CP_ACP, 0, g.cfg.scrcpy, -1, val, sizeof(val), NULL, NULL);
+    WritePrivateProfileStringA("scrdock", "scrcpy",
+                               g.cfg.scrcpy[0] ? val : NULL, ini_a);
+    WideCharToMultiByte(CP_ACP, 0, g.cfg.scrcpy_args, -1, val, sizeof(val), NULL, NULL);
+    WritePrivateProfileStringA("scrdock", "scrcpy_args",
+                               g.cfg.scrcpy_args[0] ? val : NULL, ini_a);
+    WideCharToMultiByte(CP_ACP, 0, g.cfg.adb, -1, val, sizeof(val), NULL, NULL);
+    WritePrivateProfileStringA("scrdock", "adb",
+                               g.cfg.adb[0] ? val : NULL, ini_a);
+    WritePrivateProfileStringA("scrdock", "close_scrcpy_on_exit",
+                               g.cfg.close_on_exit ? "1" : "0", ini_a);
+    const char *ctl = (g.cfg.control == 1) ? "shortcut"
+                    : (g.cfg.control == 2) ? "adb" : "auto";
+    WritePrivateProfileStringA("scrdock", "control", ctl, ini_a);
+    _itoa(g.cfg.bitrate, val, 10);
+    WritePrivateProfileStringA("scrdock", "bitrate",
+                               g.cfg.bitrate > 0 ? val : NULL, ini_a);
+    _itoa(g.cfg.max_size, val, 10);
+    WritePrivateProfileStringA("scrdock", "max_size",
+                               g.cfg.max_size > 0 ? val : NULL, ini_a);
+    _itoa(g.cfg.max_fps, val, 10);
+    WritePrivateProfileStringA("scrdock", "max_fps",
+                               g.cfg.max_fps > 0 ? val : NULL, ini_a);
+    WritePrivateProfileStringA("scrdock", "turn_screen_off",
+                               g.cfg.turn_screen_off ? "1" : NULL, ini_a);
+    WritePrivateProfileStringA("scrdock", "stay_awake",
+                               g.cfg.stay_awake ? "1" : NULL, ini_a);
+    WritePrivateProfileStringA("scrdock", "no_audio",
+                               g.cfg.no_audio ? "1" : NULL, ini_a);
+    WritePrivateProfileStringA("scrdock", "show_touches",
+                               g.cfg.show_touches ? "1" : NULL, ini_a);
+    WritePrivateProfileStringA("scrdock", "auto_reconnect",
+                               g.cfg.auto_reconnect ? "1" : "0", ini_a);
+    _itoa(g.cfg.reconnect_attempts, val, 10);
+    WritePrivateProfileStringA("scrdock", "reconnect_attempts", val, ini_a);
 }
 
 static UINT wnd_dpi(HWND hwnd)
@@ -344,53 +499,150 @@ static HWND find_scrcpy_window(DWORD pid)
     return c.sdl ? c.sdl : c.any;
 }
 
-static bool launch_scrcpy(void)
+/* Saturating formatted append (plain swprintf returns -1 on truncation,
+ * which would corrupt the running index). */
+static void cmd_catf(wchar_t *out, size_t cch, int *n, const wchar_t *fmt, ...)
 {
-    wchar_t cmd[1152];
-    wchar_t dir[MAX_PATH];
+    if (*n < 0 || (size_t) *n >= cch - 1) {
+        return;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    int k = vswprintf(out + *n, cch - (size_t) *n, fmt, ap);
+    va_end(ap);
+    *n = (k < 0) ? (int) (cch - 1) : *n + k;
+}
 
+/* Compose the scrcpy command line: -s <serial> so the session can never
+ * silently drift to another device, then the structured options, then the
+ * raw scrcpy_args tail (scrcpy applies options in order, so the tail wins
+ * and can override anything above). */
+static void build_scrcpy_cmd(wchar_t *cmd, size_t cch)
+{
+    int n = 0;
+    cmd[0] = L'\0';
+    cmd_catf(cmd, cch, &n, L"\"%s\"", g.scrcpyPath);
+    if (g.serial[0]) {
+        cmd_catf(cmd, cch, &n, L" -s %s", g.serial);
+    }
     /* Pin MOD=Left-Alt so the toolbar can send instant MOD+key shortcuts to
      * the scrcpy window (see send_scrcpy_shortcut). Skipped if the user
      * already passes --shortcut-mod of their own. */
     g.pinned_mod = (wcsstr(g.cfg.scrcpy_args, L"--shortcut-mod") == NULL);
-    if (g.cfg.scrcpy_args[0]) {
-        swprintf(cmd, 1152, L"\"%s\"%s %s", g.scrcpyPath,
-                 g.pinned_mod ? L" --shortcut-mod=lalt" : L"",
-                 g.cfg.scrcpy_args);
-    } else {
-        swprintf(cmd, 1152, L"\"%s\"%s", g.scrcpyPath,
-                 g.pinned_mod ? L" --shortcut-mod=lalt" : L"");
+    if (g.pinned_mod) {
+        cmd_catf(cmd, cch, &n, L" --shortcut-mod=lalt");
     }
+    if (g.cfg.max_size > 0) {
+        cmd_catf(cmd, cch, &n, L" --max-size=%d", g.cfg.max_size);
+    }
+    if (g.cfg.bitrate > 0) {
+        cmd_catf(cmd, cch, &n, L" --video-bit-rate=%dM", g.cfg.bitrate);
+    }
+    if (g.cfg.max_fps > 0) {
+        cmd_catf(cmd, cch, &n, L" --max-fps=%d", g.cfg.max_fps);
+    }
+    if (g.cfg.turn_screen_off) {
+        cmd_catf(cmd, cch, &n, L" --turn-screen-off");
+    }
+    if (g.cfg.stay_awake) {
+        cmd_catf(cmd, cch, &n, L" --stay-awake");
+    }
+    if (g.cfg.no_audio) {
+        cmd_catf(cmd, cch, &n, L" --no-audio");
+    }
+    if (g.cfg.show_touches) {
+        cmd_catf(cmd, cch, &n, L" --show-touches");
+    }
+    if (g.cfg.scrcpy_args[0]) {
+        cmd_catf(cmd, cch, &n, L" %s", g.cfg.scrcpy_args);
+    }
+}
 
+static bool launch_scrcpy(void)
+{
+    wchar_t cmd[1400];
+    wchar_t dir[MAX_PATH];
+
+    /* retire any previous child: stale PROCEXIT messages are gen-tagged */
+    KillTimer(g.hwnd, TIMER_RECONN);
+    g.reconnPending = false;
+    if (g.hErr) {
+        err_drain(true);
+    }
+    if (g.hProc) {
+        CloseHandle(g.hProc);
+        g.hProc = NULL;
+    }
+    g.errBuf[0] = '\0';
+    g.errLine[0] = L'\0';
+
+    build_scrcpy_cmd(cmd, 1400);
     dir_of(g.scrcpyPath, dir, MAX_PATH);
+
+    /* stderr -> pipe: launch failures become visible instead of vanishing
+     * into the void of CREATE_NO_WINDOW (e.g. "Multiple (2) ADB devices"). */
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = NULL;
+    sa.bInheritHandle = TRUE;
+    HANDLE rd = NULL, wr = NULL;
+    if (CreatePipe(&rd, &wr, &sa, 0)) {
+        SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+    } else {
+        rd = wr = NULL;
+    }
 
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     ZeroMemory(&si, sizeof(si));
     ZeroMemory(&pi, sizeof(pi));
     si.cb = sizeof(si);
+    if (wr) {
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdOutput = g.hNul;
+        si.hStdError = wr;
+        si.hStdInput = NULL;
+    }
 
     /* CREATE_NO_WINDOW: scrcpy.exe is a console app; never flash a console.
      * Working directory = scrcpy dir so a portable dist finds scrcpy-server. */
-    if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, wr != NULL, CREATE_NO_WINDOW,
                         NULL, dir[0] ? dir : NULL, &si, &pi)) {
         dbg_log(L"launch_scrcpy: CreateProcessW failed (%lu)", GetLastError());
+        if (rd) {
+            CloseHandle(rd);
+        }
+        if (wr) {
+            CloseHandle(wr);
+        }
         return false;
     }
     CloseHandle(pi.hThread);
+    if (wr) {
+        CloseHandle(wr); /* the child holds the only write end now */
+    }
+    g.hErr = rd;
     g.hProc = pi.hProcess;
     g.pid = pi.dwProcessId;
     g.launched = true;
     g.launchTick = GetTickCount64();
+    g.procGen++;
+
+    /* a brand new process: re-target the window hooks and hunt for the SDL
+     * window (the toolbar re-docks when it appears) */
+    g.target = NULL;
+    hooks_install(g.pid);
+    hunting_start();
     return true;
 }
 
 /* Close scrcpy gracefully (WM_CLOSE -> SDL3 quit-on-last-window-close),
  * pumping messages while waiting: the EVENT_OBJECT_DESTROY callback for the
- * dying window is marshaled to this same thread. */
+ * dying window is marshaled to this same thread. Always closes the child we
+ * launched (used both for toolbar exit and for switching devices). */
 static void close_scrcpy_and_wait(void)
 {
-    if (!g.cfg.close_on_exit || !g.launched || !g.hProc) {
+    if (!g.launched || !g.hProc) {
         return;
     }
     if (WaitForSingleObject(g.hProc, 0) == WAIT_OBJECT_0) {
@@ -411,15 +663,15 @@ static void close_scrcpy_and_wait(void)
         DWORD r = MsgWaitForMultipleObjectsEx(1, &g.hProc, 50, QS_ALLINPUT,
                                               MWMO_INPUTAVAILABLE);
         if (r == WAIT_OBJECT_0 + 1) {
-            MSG m;
-            while (PeekMessageW(&m, NULL, 0, 0, PM_REMOVE)) {
-                if (m.message == WM_QUIT) {
+            MSG msg;
+            while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+                if (msg.message == WM_QUIT) {
                     /* re-post: the outer loop must still see it */
-                    PostQuitMessage((int) m.wParam);
+                    PostQuitMessage((int) msg.wParam);
                     return;
                 }
-                TranslateMessage(&m);
-                DispatchMessageW(&m);
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
             }
         }
     }
@@ -668,72 +920,390 @@ static bool parse_size_line(const char *buf, int *w, int *h)
     return false;
 }
 
-static unsigned __stdcall device_probe_thread(void *arg)
+/* ------------------------------------------------------------------ */
+/* device tracking: resident "adb track-devices" reader + metadata      */
+
+static bool dev_online(const wchar_t *serial)
 {
-    (void) arg;
-    wchar_t cmd[600];
-    char buf[4096];
-    char serials[4][64];
-    int count = 0;
-    DWORD ec = 0;
-
-    if (!g.adbOk || !g.hwnd) {
-        return 0;
+    int i;
+    if (!g.devList || !serial[0]) {
+        return false;
     }
-
-    /* "adb devices -l" (no -s here by definition) */
-    swprintf(cmd, 600, L"\"%s\" devices -l", g.adbPath);
-    if (!capture_sync(cmd, buf, sizeof(buf), 30000, &ec)) {
-        PostMessageW(g.hwnd, WM_APP_DEVREADY, 0, 0);
-        return 0;
+    for (i = 0; i < g.devList->count; i++) {
+        if (wcscmp(g.devList->v[i].serial, serial) == 0
+                && wcscmp(g.devList->v[i].state, L"device") == 0) {
+            return true;
+        }
     }
+    return false;
+}
 
-    /* lines: "<serial>\t<state> ..." — count entries in state "device" */
-    char *ctx = NULL;
-    char *line = strtok_s(buf, "\r\n", &ctx);
-    bool first = true;
-    while (line && count < 4) {
-        if (first) {
-            first = false; /* "List of devices attached" */
-        } else if (line[0]) {
-            char sp[128];
-            char st[32];
-            if (sscanf(line, "%127s %31s", sp, st) == 2
-                    && strcmp(st, "device") == 0) {
-                strncpy(serials[count], sp, 63);
-                serials[count][63] = '\0';
-                count++;
+static int dev_count_online(void)
+{
+    int i, n = 0;
+    if (g.devList) {
+        for (i = 0; i < g.devList->count; i++) {
+            if (wcscmp(g.devList->v[i].state, L"device") == 0) {
+                n++;
             }
+        }
+    }
+    return n;
+}
+
+/* ---- scrcpy stderr tail (failure surfacing) ---- */
+
+static void err_append(const char *s, size_t n)
+{
+    size_t len = strlen(g.errBuf);
+    if (len + n >= sizeof(g.errBuf)) {
+        size_t drop = len + n + 1 - sizeof(g.errBuf);
+        memmove(g.errBuf, g.errBuf + drop, len - drop + 1);
+        len = strlen(g.errBuf);
+    }
+    memcpy(g.errBuf + len, s, n);
+    g.errBuf[len + n] = '\0';
+}
+
+/* Pump the stderr pipe into the rolling buffer (non-blocking) so a verbose
+ * session can never fill the pipe and stall scrcpy; on the final drain the
+ * read handle is closed as well. UI thread only. */
+static void err_drain(bool final)
+{
+    if (!g.hErr) {
+        return;
+    }
+    for (;;) {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(g.hErr, NULL, 0, NULL, &avail, NULL) || !avail) {
+            break;
+        }
+        char chunk[512];
+        DWORD want = avail < sizeof(chunk) ? avail : (DWORD) sizeof(chunk);
+        DWORD rd = 0;
+        if (!ReadFile(g.hErr, chunk, want, &rd, NULL) || !rd) {
+            break;
+        }
+        err_append(chunk, rd);
+    }
+    if (final) {
+        CloseHandle(g.hErr);
+        g.hErr = NULL;
+    }
+}
+
+/* Last "ERROR" line from scrcpy's stderr, else the buffer tail. */
+static void err_last_line(wchar_t *out, size_t cch)
+{
+    const char *base = g.errBuf;
+    const char *found = NULL;
+    const char *p = g.errBuf;
+    while ((p = strstr(p, "ERROR")) != NULL) {
+        found = p;
+        p += 5;
+    }
+    if (!found) {
+        size_t len = strlen(g.errBuf);
+        if (len > 200) {
+            base = g.errBuf + len - 200;
+        }
+        found = base;
+    }
+    const char *e = strchr(found, '\n');
+    size_t n = e ? (size_t) (e - found) : strlen(found);
+    if (n > 200) {
+        n = 200;
+    }
+    int w = MultiByteToWideChar(CP_UTF8, 0, found, (int) n, out, (int) cch - 1);
+    if (w < 0) {
+        w = 0;
+    }
+    out[w] = L'\0';
+    while (w > 0 && (out[w - 1] == L'\r' || out[w - 1] == L'\n'
+                     || out[w - 1] == L' ')) {
+        out[--w] = L'\0';
+    }
+}
+
+/* ---- device polling ---- */
+
+/* "adb devices" output lines: "List of devices attached", then one
+ * "<serial>\t<state>" per device (state: device/offline/unauthorized/...). */
+static void devlist_parse(const char *text, struct DevList *dl)
+{
+    char *dup = _strdup(text ? text : "");
+    if (!dup) {
+        return;
+    }
+    char *ctx = NULL;
+    char *line = strtok_s(dup, "\r\n", &ctx);
+    while (line && dl->count < DEV_MAX) {
+        char sp[64], st[16];
+        if (sscanf(line, "%63s %15s", sp, st) == 2
+                && strncmp(sp, "List", 4) != 0) {
+            MultiByteToWideChar(CP_ACP, 0, sp, -1,
+                                dl->v[dl->count].serial, 64);
+            MultiByteToWideChar(CP_ACP, 0, st, -1,
+                                dl->v[dl->count].state, 16);
+            dl->count++;
         }
         line = strtok_s(NULL, "\r\n", &ctx);
     }
+    free(dup);
+}
 
-    if (count == 0) {
-        PostMessageW(g.hwnd, WM_APP_DEVREADY, 0, 0);
-        return 0;
-    }
-    if (!g.serial[0] && !g.cfg.serial[0]) {
-        MultiByteToWideChar(CP_ACP, 0, serials[0], -1, g.serial, 128);
-    }
+/* Poll "adb devices" every 1.5 s and post a fresh DevList when it changed.
+ *
+ * Why polling instead of "adb track-devices": the CLI output of
+ * track-devices has NO framing between snapshots (verified empirically: the
+ * initial update is just "serial\tstate\r\n" with no blank-line separator),
+ * so a stream parser cannot tell where one snapshot ends. Speaking the adb
+ * smart-socket protocol directly would fix that, but a light poll also
+ * survives adb-server restarts for free. */
+static unsigned __stdcall track_thread(void *arg)
+{
+    (void) arg;
+    struct DevList last;
+    bool have_last = false;
+    wchar_t cmd[MAX_PATH + 32];
+    char buf[2048];
+    DWORD ec = 0;
 
-    if (count >= 1) {
-        wchar_t serial_tmp[128];
-        wchar_t *serial = g.serial[0] ? g.serial : g.cfg.serial;
-        if (!serial[0]) {
-            MultiByteToWideChar(CP_ACP, 0, serials[0], -1, serial_tmp, 128);
-            serial = serial_tmp;
-        }
-        swprintf(cmd, 600, L"\"%s\" -s %s shell wm size", g.adbPath, serial);
+    swprintf(cmd, MAX_PATH + 32, L"\"%s\" devices", g.adbPath);
+    for (;;) {
+        buf[0] = '\0';
         if (capture_sync(cmd, buf, sizeof(buf), 10000, &ec)) {
-            int w = 0, h = 0;
-            if (parse_size_line(buf, &w, &h)) {
-                g.scrW = w;
-                g.scrH = h;
+            struct DevList dl;
+            ZeroMemory(&dl, sizeof(dl));
+            devlist_parse(buf, &dl);
+            if (!have_last || memcmp(&last, &dl, sizeof(dl)) != 0) {
+                struct DevList *heap_dl = malloc(sizeof(*heap_dl));
+                if (heap_dl) {
+                    *heap_dl = dl;
+                    last = dl;
+                    have_last = true;
+                    if (g.hwnd) {
+                        PostMessageW(g.hwnd, WM_APP_DEVLIST,
+                                     (WPARAM) heap_dl, 0);
+                    } else {
+                        free(heap_dl);
+                    }
+                }
+            }
+        }
+        if (g.trackStop
+                && WaitForSingleObject(g.trackStop, 1500) == WAIT_OBJECT_0) {
+            break;
+        }
+    }
+    return 0;
+}
+
+static void track_start(void)
+{
+    if (g.trackOn || !g.adbOk || !g.hwnd) {
+        return;
+    }
+    g.trackStop = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!g.trackStop) {
+        return;
+    }
+    uintptr_t th = _beginthreadex(NULL, 0, track_thread, NULL, 0, NULL);
+    if (th) {
+        g.trackOn = true;
+        g.hTrack = (HANDLE) th;
+    } else {
+        CloseHandle(g.trackStop);
+        g.trackStop = NULL;
+    }
+}
+
+static void track_stop(void)
+{
+    if (g.trackStop) {
+        SetEvent(g.trackStop);
+    }
+    if (g.hTrack) {
+        WaitForSingleObject(g.hTrack, 2000);
+        CloseHandle(g.hTrack);
+        g.hTrack = NULL;
+    }
+    if (g.trackStop) {
+        CloseHandle(g.trackStop);
+        g.trackStop = NULL;
+    }
+    g.trackOn = false;
+}
+
+/* ---- device metadata (model / android / battery / wm size) ---- */
+
+struct MetaWork {
+    int count;
+    wchar_t sel[64];
+    wchar_t serials[DEV_MAX][64];
+};
+
+static void meta_getprop(const wchar_t *serial, const char *prop,
+                         wchar_t *out, size_t cch)
+{
+    wchar_t cmd[MAX_PATH + 160];
+    char buf[256];
+    DWORD ec = 0;
+    /* %S: narrow string inside a wide format (MSVC wide printf) */
+    swprintf(cmd, MAX_PATH + 160, L"\"%s\" -s %s shell getprop %S",
+             g.adbPath, serial, prop);
+    out[0] = L'\0';
+    if (capture_sync(cmd, buf, sizeof(buf), 8000, &ec) && ec == 0) {
+        char *e = buf + strlen(buf);
+        while (e > buf && (e[-1] == '\r' || e[-1] == '\n' || e[-1] == ' ')) {
+            *--e = '\0';
+        }
+        MultiByteToWideChar(CP_UTF8, 0, buf, -1, out, (int) cch - 1);
+    }
+}
+
+static int meta_battery(const wchar_t *serial)
+{
+    wchar_t cmd[MAX_PATH + 96];
+    char buf[4096];
+    DWORD ec = 0;
+    swprintf(cmd, MAX_PATH + 96, L"\"%s\" -s %s shell dumpsys battery",
+             g.adbPath, serial);
+    if (capture_sync(cmd, buf, sizeof(buf), 8000, &ec)) {
+        const char *p = strstr(buf, " level:");
+        if (p) {
+            int v = atoi(p + 7);
+            if (v > 0 && v <= 100) {
+                return v;
             }
         }
     }
+    return -1;
+}
 
-    PostMessageW(g.hwnd, WM_APP_DEVREADY, (WPARAM) (count == 1 ? 1 : 2), 0);
+static unsigned __stdcall meta_thread(void *arg)
+{
+    struct MetaWork *w = (struct MetaWork *) arg;
+    struct DevMetaBatch *mb = calloc(1, sizeof(*mb));
+    int i;
+    if (mb) {
+        for (i = 0; i < w->count && mb->count < DEV_MAX; i++) {
+            struct DevMeta *dm = &mb->v[mb->count];
+            wcsncpy(dm->serial, w->serials[i], 63);
+            dm->serial[63] = L'\0';
+            meta_getprop(dm->serial, "ro.product.model", dm->model, 64);
+            meta_getprop(dm->serial, "ro.build.version.release",
+                         dm->android, 16);
+            dm->battery = meta_battery(dm->serial);
+            mb->count++;
+        }
+        if (w->sel[0]) {
+            wchar_t cmd[MAX_PATH + 96];
+            char buf[512];
+            DWORD ec = 0;
+            swprintf(cmd, MAX_PATH + 96, L"\"%s\" -s %s shell wm size",
+                     g.adbPath, w->sel);
+            if (capture_sync(cmd, buf, sizeof(buf), 8000, &ec)) {
+                parse_size_line(buf, &mb->scrW, &mb->scrH);
+            }
+        }
+    }
+    free(w);
+    if (g.hwnd) {
+        PostMessageW(g.hwnd, WM_APP_DEVMETA, (WPARAM) mb, 0);
+    } else {
+        free(mb);
+    }
+    return 0;
+}
+
+/* Refresh device metadata (model/version/battery + wm size) off-thread;
+ * coalesced: while a fetch runs, one more request is remembered. */
+static void meta_spawn(void)
+{
+    int i;
+    if (g.metaBusy) {
+        g.metaPending = true;
+        return;
+    }
+    if (!g.devList || !g.adbOk) {
+        return;
+    }
+    struct MetaWork *w = calloc(1, sizeof(*w));
+    if (!w) {
+        return;
+    }
+    for (i = 0; i < g.devList->count && w->count < DEV_MAX; i++) {
+        if (wcscmp(g.devList->v[i].state, L"device") == 0) {
+            wcsncpy(w->serials[w->count], g.devList->v[i].serial, 63);
+            w->serials[w->count][63] = L'\0';
+            w->count++;
+        }
+    }
+    if (!w->count) {
+        free(w);
+        return;
+    }
+    wcsncpy(w->sel, g.serial, 63);
+    w->sel[63] = L'\0';
+    g.metaBusy = true;
+    uintptr_t th = _beginthreadex(NULL, 0, meta_thread, w, 0, NULL);
+    if (th) {
+        CloseHandle((HANDLE) th);
+    } else {
+        g.metaBusy = false;
+        free(w);
+    }
+}
+
+/* ---- path/version detection (路径页"检测") ---- */
+
+static unsigned __stdcall detect_thread(void *arg)
+{
+    (void) arg;
+    wchar_t *out = malloc(512 * sizeof(wchar_t));
+    if (!out) {
+        return 0;
+    }
+    wchar_t cmd[MAX_PATH + 32];
+    char buf[512];
+    DWORD ec = 0;
+    wchar_t line[128];
+    out[0] = L'\0';
+    if (file_exists(g.scrcpyPath)) {
+        swprintf(cmd, MAX_PATH + 32, L"\"%s\" --version", g.scrcpyPath);
+        if (capture_sync(cmd, buf, sizeof(buf), 10000, &ec) && ec == 0) {
+            char *nl = strchr(buf, '\n');
+            if (nl) {
+                *nl = '\0';
+            }
+            MultiByteToWideChar(CP_UTF8, 0, buf, -1, line, 127);
+            swprintf(out + wcslen(out), 512 - wcslen(out),
+                     L"scrcpy: %s\r\n", line);
+        } else {
+            wcscat(out, L"scrcpy: 存在但无法运行\r\n");
+        }
+    } else {
+        wcscat(out, L"scrcpy: 未找到（请设置路径）\r\n");
+    }
+    if (g.adbPath[0] && file_exists(g.adbPath)) {
+        swprintf(cmd, MAX_PATH + 32, L"\"%s\" version", g.adbPath);
+        if (capture_sync(cmd, buf, sizeof(buf), 10000, &ec)) {
+            char *nl = strchr(buf, '\n');
+            if (nl) {
+                *nl = '\0';
+            }
+            MultiByteToWideChar(CP_UTF8, 0, buf, -1, line, 127);
+            swprintf(out + wcslen(out), 512 - wcslen(out), L"adb: %s", line);
+        }
+    } else {
+        wcscat(out, L"adb: 未找到");
+    }
+    if (g.hwnd) {
+        PostMessageW(g.hwnd, WM_APP_DETECTED, (WPARAM) out, 0);
+    } else {
+        free(out);
+    }
     return 0;
 }
 
@@ -946,7 +1516,7 @@ static void tip_show(int i)
     if (!g.tips || i < 0) {
         return;
     }
-    const wchar_t *txt = (i == ID_SHOT && g.tipStatus[0])
+    const wchar_t *txt = ((i == ID_SHOT || i == ID_MGR) && g.tipStatus[0])
         ? g.tipStatus : kBtns[i].tip;
     if (i == ID_PIN) {
         txt = g.pinned ? L"取消窗口置顶" : L"窗口置顶（scrcpy + 工具栏）";
@@ -1025,7 +1595,7 @@ static void draw_button(HDC dc, int i)
     DeleteObject(pen);
     DeleteObject(br);
 
-    bool disabled = !g.adbOk && i != ID_CLOSE;
+    bool disabled = !g.adbOk && i != ID_CLOSE && i != ID_MGR;
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, disabled ? RGB(120, 120, 120) : RGB(240, 240, 240));
 
@@ -1218,7 +1788,9 @@ static VOID CALLBACK win_event_cb(HWINEVENTHOOK hook, DWORD ev, HWND hwnd,
 static void hooks_install(DWORD pid)
 {
     /* 3rd param (hmodWinEventProc) must be NULL for WINEVENT_OUTOFCONTEXT.
-     * Contiguous object-event range covers DESTROY/SHOW/HIDE/.../LOCATIONCHANGE. */
+     * Contiguous object-event range covers DESTROY/SHOW/HIDE/.../LOCATIONCHANGE.
+     * Remove first: relaunching must not leak the previous hook pair. */
+    hooks_remove();
     g.hookObj = SetWinEventHook(EVENT_OBJECT_DESTROY,
                                 EVENT_OBJECT_LOCATIONCHANGE,
                                 NULL, win_event_cb, pid, 0,
@@ -1238,6 +1810,1004 @@ static void hooks_remove(void)
     if (g.hookSys) {
         UnhookWinEvent(g.hookSys);
         g.hookSys = NULL;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* manager window (设备 / 参数 / 路径)                                  */
+
+#define MGR_W_96 600
+#define MGR_H_96 528
+
+enum { MPAGE_DEV, MPAGE_OPT, MPAGE_PATH, MPAGE_COUNT };
+
+enum {
+    MID_LV = 1, MID_REFRESH, MID_CONNECT, MID_REMEMBER,
+    MID_BITRATE, MID_MAXSIZE, MID_MAXFPS,
+    MID_CHK_SCREENOFF, MID_CHK_STAYAWAKE, MID_CHK_NOAUDIO, MID_CHK_TOUCH,
+    MID_CHK_RECONN, MID_RECONN_N, MID_CHK_CLOSEEXIT, MID_EXTRA,
+    MID_OPT_SAVE,
+    MID_SCRCPY_ED, MID_SCRCPY_BR, MID_ADB_ED, MID_ADB_BR,
+    MID_DETECT, MID_PATH_SAVE
+};
+
+static struct {
+    HWND frame;
+    int tabSel;                 /* active page index                      */
+    RECT tabRc[MPAGE_COUNT];    /* self-drawn tab strip cells (client)    */
+    RECT hdrRc;                 /* self-drawn title bar                   */
+    RECT closeRc;               /* self-drawn close cell in the header    */
+    HWND page[MPAGE_COUNT];
+    HWND lv, refresh, connect, remember, status, errview;
+    HWND bitrate, maxsize, maxfps, chkScreenOff, chkStayAwake, chkNoAudio,
+         chkTouch, chkReconn, reconnN, chkCloseExit, extra, optSave;
+    HWND scrcpyEd, scrcpyBr, adbEd, adbBr, detect, pathSave, detectOut;
+    HBRUSH brBg;                /* page background (dark)                 */
+    HBRUSH brEdit;              /* edit background                        */
+    HFONT font;                 /* 10.5pt Microsoft YaHei (manager)       */
+    HFONT fontB;                /* semibold variant (title/tabs/labels)   */
+} m;
+
+/* Uniform 96-dpi control metrics: one height for inputs/checkboxes, one for
+ * buttons, a fixed row pitch, and a shared label column. Everything on a
+ * page aligns to this grid. */
+#define MG_ROW_H_96   30
+#define MG_BTN_H_96   32
+#define MG_PITCH_96   42
+#define MG_LBL_X_96   0
+#define MG_LBL_W_96   170
+#define MG_CTL_X_96   178
+
+/* 10.5pt (五号) Microsoft YaHei: pixel size = 10.5 * dpi / 72 = 21*dpi/144 */
+static HFONT mgr_font_make(bool bold, UINT dpi)
+{
+    return CreateFontW(-MulDiv(21, dpi, 144), 0, 0, 0,
+                       bold ? FW_SEMIBOLD : FW_NORMAL, 0, 0, 0,
+                       DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                       CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                       DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei");
+}
+
+#define ISCHK(h) ((h) && SendMessageW((h), BM_GETCHECK, 0, 0) == BST_CHECKED)
+
+static HWND mkctl(HWND parent, const wchar_t *cls, DWORD style,
+                  const wchar_t *text, int x, int y, int w, int h,
+                  int id, UINT dpi)
+{
+    /* push buttons become owner-drawn (dark theme); checkboxes stay native */
+    if (wcscmp(cls, L"BUTTON") == 0 && !(style & BS_AUTOCHECKBOX)) {
+        style |= BS_OWNERDRAW;
+    }
+    HWND ctl = CreateWindowExW(0, cls, text ? text : L"",
+                               WS_CHILD | WS_VISIBLE | style,
+                               MulDiv(x, dpi, 96), MulDiv(y, dpi, 96),
+                               MulDiv(w, dpi, 96), MulDiv(h, dpi, 96),
+                               parent, (HMENU) (INT_PTR) id, g_hInst, NULL);
+    if (ctl) {
+        SendMessageW(ctl, WM_SETFONT,
+                     (WPARAM) (m.font ? m.font : g.fUi), TRUE);
+    }
+    return ctl;
+}
+
+/* grid helpers: a label row and a flat edit, both MG_ROW_H_96. Labels use
+ * SS_CENTERIMAGE: without it a STATIC draws its text at the TOP of the rect
+ * while edits/buttons center theirs — that is the classic "labels sit too
+ * high" misalignment. */
+static HWND mgr_label(HWND page, UINT dpi, const wchar_t *text,
+                      int x, int y, int w)
+{
+    return mkctl(page, L"STATIC", SS_NOPREFIX | SS_CENTERIMAGE, text,
+                 x, y, w, MG_ROW_H_96, 0, dpi);
+}
+
+static HWND mgr_edit(HWND page, UINT dpi, const wchar_t *text,
+                     int x, int y, int w, DWORD extra, int id)
+{
+    return mkctl(page, L"EDIT",
+                 ES_AUTOHSCROLL | WS_TABSTOP | extra,
+                 text, x, y, w, MG_ROW_H_96, id, dpi);
+}
+
+static HWND mgr_check(HWND page, UINT dpi, const wchar_t *text,
+                      int x, int y, int w, int id)
+{
+    return mkctl(page, L"BUTTON", BS_AUTOCHECKBOX | WS_TABSTOP,
+                 text, x, y, w, MG_ROW_H_96, id, dpi);
+}
+
+static HWND mgr_button(HWND page, UINT dpi, const wchar_t *text,
+                       int x, int y, int w, int id)
+{
+    return mkctl(page, L"BUTTON", WS_TABSTOP, text, x, y, w, MG_BTN_H_96,
+                 id, dpi);
+}
+
+/* ---- dark "floating window" theme, matching the toolbar palette ---- */
+
+/* DWM dark border + rounded corners; the window itself is frameless with a
+ * self-drawn header (a dark native title bar keeps near-black caption text
+ * on some builds — unusable, so we do not use WS_CAPTION at all). */
+static void mgr_dark_titlebar(HWND hwnd)
+{
+    typedef HRESULT (WINAPI *PFN_DSWA)(HWND, DWORD, LPCVOID, DWORD);
+    HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
+    if (!dwm) {
+        return;
+    }
+    PFN_DSWA set = (PFN_DSWA) (void *) GetProcAddress(dwm,
+                                                      "DwmSetWindowAttribute");
+    if (set) {
+        BOOL dark = TRUE;
+        if (set(hwnd, 20, &dark, sizeof(dark)) != 0) {
+            set(hwnd, 19, &dark, sizeof(dark)); /* 1809/1903 attribute id */
+        }
+        DWORD round = 2; /* DWMWCP_ROUND */
+        set(hwnd, 33, &round, sizeof(round));
+    }
+    FreeLibrary(dwm);
+}
+
+/* owner-draw push button: rounded dark cell like the toolbar buttons */
+static void draw_dark_button(DRAWITEMSTRUCT *di)
+{
+    HDC dc = di->hDC;
+    RECT rc = di->rcItem;
+    bool sel = (di->itemState & ODS_SELECTED) != 0;
+    bool dis = (di->itemState & ODS_DISABLED) != 0;
+    /* fill the whole item first: the BUTTON class background brush is a
+     * light system color and would peek through the rounded corners */
+    HBRUSH back = CreateSolidBrush(RGB(32, 32, 32));
+    FillRect(dc, &rc, back);
+    DeleteObject(back);
+    COLORREF bg = dis ? RGB(38, 38, 38) : sel ? RGB(87, 87, 87)
+                  : RGB(55, 55, 58);
+    HBRUSH br = CreateSolidBrush(bg);
+    HPEN pen = CreatePen(PS_SOLID, 1, RGB(80, 80, 80));
+    HGDIOBJ old_pen = SelectObject(dc, pen);
+    HGDIOBJ old_br = SelectObject(dc, br);
+    RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, 6, 6);
+    SelectObject(dc, old_br);
+    SelectObject(dc, old_pen);
+    DeleteObject(pen);
+    DeleteObject(br);
+    wchar_t txt[64];
+    int n = GetWindowTextW(di->hwndItem, txt, 64);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, dis ? RGB(120, 120, 120) : RGB(240, 240, 240));
+    HGDIOBJ old_f = SelectObject(dc, m.font ? m.font : g.fUi);
+    DrawTextW(dc, txt, n, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(dc, old_f);
+}
+
+/* page container: dark background + dark-color routing for all children */
+static LRESULT CALLBACK mgr_page_proc(HWND hwnd, UINT msg, WPARAM wp,
+                                      LPARAM lp)
+{
+    switch (msg) {
+    case WM_ERASEBKGND:
+        {
+            HDC dc = (HDC) wp;
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            HBRUSH br = m.brBg ? m.brBg : GetStockBrush(BLACK_BRUSH);
+            FillRect(dc, &rc, br);
+        }
+        return 1;
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+        {
+            HDC dc = (HDC) wp;
+            bool is_edit = (msg == WM_CTLCOLOREDIT)
+                || (GetWindowLongPtrW((HWND) lp, GWL_STYLE) & ES_READONLY);
+            SetBkColor(dc, is_edit ? RGB(43, 43, 43) : RGB(32, 32, 32));
+            SetTextColor(dc, RGB(230, 230, 230));
+            return (LRESULT) (is_edit ? m.brEdit : m.brBg);
+        }
+    case WM_CTLCOLORBTN:
+        /* owner-draw buttons: dark background behind the rounded corners */
+        return (LRESULT) (m.brBg ? m.brBg : GetStockBrush(BLACK_BRUSH));
+    case WM_DRAWITEM:
+        if (wp) { /* control id != 0 */
+            draw_dark_button((DRAWITEMSTRUCT *) lp);
+            return TRUE;
+        }
+        break;
+    default:
+        break;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static struct DevMeta *meta_find(const wchar_t *serial)
+{
+    int i;
+    for (i = 0; i < g.devMeta.count; i++) {
+        if (wcscmp(g.devMeta.v[i].serial, serial) == 0) {
+            return &g.devMeta.v[i];
+        }
+    }
+    return NULL;
+}
+
+/* friendlier text for the common adb states */
+static const wchar_t *dev_state_text(const wchar_t *state)
+{
+    if (wcscmp(state, L"device") == 0) {
+        return L"在线";
+    }
+    if (wcscmp(state, L"offline") == 0) {
+        return L"离线";
+    }
+    if (wcscmp(state, L"unauthorized") == 0) {
+        return L"待授权";
+    }
+    return state;
+}
+
+static const wchar_t *dev_conn_text(const wchar_t *serial)
+{
+    if (wcsncmp(serial, L"emulator-", 9) == 0) {
+        return L"模拟器";
+    }
+    if (wcschr(serial, L':')) {
+        return L"网络";
+    }
+    return L"USB";
+}
+
+static void mgr_list_reload(void)
+{
+    int i;
+    if (!m.lv || !g.devList) {
+        return;
+    }
+    SendMessageW(m.lv, WM_SETREDRAW, FALSE, 0);
+    ListView_DeleteAllItems(m.lv);
+    int selItem = -1;
+    for (i = 0; i < g.devList->count; i++) {
+        struct DevInfo *d = &g.devList->v[i];
+        struct DevMeta *dm = meta_find(d->serial);
+        wchar_t battery[16];
+        wchar_t android[32];
+        LVITEMW it;
+        ZeroMemory(&it, sizeof(it));
+        it.mask = LVIF_TEXT | LVIF_PARAM;
+        it.iItem = i;
+        it.iSubItem = 0;
+        it.pszText = (LPWSTR) dev_state_text(d->state);
+        it.lParam = (LPARAM) i;
+        ListView_InsertItem(m.lv, &it);
+        ListView_SetItemText(m.lv, i, 1, d->serial);
+        ListView_SetItemText(m.lv, i, 2, dm ? dm->model : (LPWSTR) L"—");
+        if (dm && dm->android[0]) {
+            swprintf(android, 32, L"Android %s", dm->android);
+            ListView_SetItemText(m.lv, i, 3, android);
+        } else {
+            ListView_SetItemText(m.lv, i, 3, (LPWSTR) L"—");
+        }
+        ListView_SetItemText(m.lv, i, 4, (LPWSTR) dev_conn_text(d->serial));
+        if (dm && dm->battery >= 0) {
+            swprintf(battery, 16, L"%d%%", dm->battery);
+            ListView_SetItemText(m.lv, i, 5, battery);
+        } else {
+            ListView_SetItemText(m.lv, i, 5, (LPWSTR) L"—");
+        }
+        if (wcscmp(d->serial, g.serial) == 0) {
+            selItem = i;
+        }
+    }
+    if (selItem >= 0) {
+        ListView_SetItemState(m.lv, selItem,
+                              LVIS_SELECTED | LVIS_FOCUSED,
+                              LVIS_SELECTED | LVIS_FOCUSED);
+    }
+    SendMessageW(m.lv, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(m.lv, NULL, FALSE);
+}
+
+static void mgr_update_status(void)
+{
+    if (!m.status) {
+        return;
+    }
+    wchar_t run[320];
+    if (g.hProc) {
+        swprintf(run, 320, L"运行中 (pid %lu)", g.pid);
+    } else if (g.reconnPending) {
+        swprintf(run, 320, L"等待设备上线重连 (%d/%d)",
+                 g.reconnAttempts, g.cfg.reconnect_attempts);
+    } else if (g.errLine[0]) {
+        swprintf(run, 320, L"已退出: %s", g.errLine);
+    } else if (g.launched) {
+        wcscpy(run, L"已退出");
+    } else {
+        wcscpy(run, L"未由本工具启动");
+    }
+    wchar_t txt[512];
+    swprintf(txt, 512, L"目标设备: %s   |   scrcpy: %s",
+             g.serial[0] ? g.serial : L"（未选择）", run);
+    SetWindowTextW(m.status, txt);
+    wchar_t tail[1200];
+    MultiByteToWideChar(CP_UTF8, 0, g.errBuf, -1, tail, 1199);
+    tail[1199] = L'\0';
+    if (m.errview) {
+        SetWindowTextW(m.errview, tail);
+    }
+}
+
+static void mgr_refresh(void)
+{
+    if (!m.frame) {
+        return;
+    }
+    mgr_list_reload();
+    mgr_update_status();
+}
+
+/* 双击列表项 = 连接该设备 */
+static void mgr_connect_selected(void)
+{
+    if (!m.lv || !g.devList) {
+        return;
+    }
+    int it = ListView_GetNextItem(m.lv, -1, LVNI_SELECTED);
+    if (it < 0) {
+        return;
+    }
+    LVITEMW vi;
+    ZeroMemory(&vi, sizeof(vi));
+    vi.mask = LVIF_PARAM;
+    vi.iItem = it;
+    if (!ListView_GetItem(m.lv, &vi)) {
+        return;
+    }
+    int di = (int) vi.lParam;
+    if (di < 0 || di >= g.devList->count) {
+        return;
+    }
+    struct DevInfo *d = &g.devList->v[di];
+
+    wcsncpy(g.serial, d->serial, 127);
+    g.serial[127] = L'\0';
+    if (ISCHK(m.remember)) {
+        wcsncpy(g.cfg.serial, d->serial, 127);
+        g.cfg.serial[127] = L'\0';
+    } else {
+        g.cfg.serial[0] = L'\0';
+    }
+    ini_save();
+    g.procGen++; /* invalidate any queued PROCEXIT from the old child */
+    if (g.hProc) {
+        close_scrcpy_and_wait(); /* switch: always close the old session */
+    }
+    launch_scrcpy();
+    g.reconnAttempts = 0;
+    g.reconnPending = false;
+    swprintf(g.tipStatus, MAX_PATH + 32, L"已连接 %s", d->serial);
+    mgr_refresh();
+}
+
+/* normalize multiline edit content into a single command-line tail */
+static void mgr_read_extra(void)
+{
+    wchar_t buf[600];
+    if (!m.extra) {
+        return;
+    }
+    GetWindowTextW(m.extra, buf, 600);
+    wchar_t *p = buf;
+    while (*p) {
+        if (*p == L'\r' || *p == L'\n') {
+            *p = L' ';
+        }
+        p++;
+    }
+    /* trim trailing spaces */
+    p = buf + wcslen(buf);
+    while (p > buf && p[-1] == L' ') {
+        *--p = L'\0';
+    }
+    wcsncpy(g.cfg.scrcpy_args, buf, 511);
+    g.cfg.scrcpy_args[511] = L'\0';
+}
+
+static void mgr_opt_save(void)
+{
+    wchar_t t[64];
+    GetWindowTextW(m.bitrate, t, 64);
+    g.cfg.bitrate = _wtoi(t);
+    GetWindowTextW(m.maxsize, t, 64);
+    g.cfg.max_size = _wtoi(t);
+    GetWindowTextW(m.maxfps, t, 64);
+    g.cfg.max_fps = _wtoi(t);
+    g.cfg.turn_screen_off = ISCHK(m.chkScreenOff);
+    g.cfg.stay_awake = ISCHK(m.chkStayAwake);
+    g.cfg.no_audio = ISCHK(m.chkNoAudio);
+    g.cfg.show_touches = ISCHK(m.chkTouch);
+    g.cfg.auto_reconnect = ISCHK(m.chkReconn);
+    g.cfg.close_on_exit = ISCHK(m.chkCloseExit);
+    GetWindowTextW(m.reconnN, t, 64);
+    g.cfg.reconnect_attempts = _wtoi(t);
+    if (g.cfg.reconnect_attempts < 1) {
+        g.cfg.reconnect_attempts = 1;
+    }
+    if (g.cfg.reconnect_attempts > 99) {
+        g.cfg.reconnect_attempts = 99;
+    }
+    mgr_read_extra();
+    ini_save();
+    wcscpy(g.tipStatus, L"参数已保存，下次连接生效");
+}
+
+static void mgr_path_save(void)
+{
+    wchar_t buf[MAX_PATH];
+    if (m.scrcpyEd) {
+        GetWindowTextW(m.scrcpyEd, buf, MAX_PATH);
+        buf[MAX_PATH - 1] = L'\0';
+        wchar_t *p = buf + wcslen(buf);
+        while (p > buf && p[-1] == L' ') {
+            *--p = L'\0';
+        }
+        wcsncpy(g.cfg.scrcpy, buf, MAX_PATH - 1);
+        g.cfg.scrcpy[MAX_PATH - 1] = L'\0';
+    }
+    if (m.adbEd) {
+        GetWindowTextW(m.adbEd, buf, MAX_PATH);
+        buf[MAX_PATH - 1] = L'\0';
+        wchar_t *p = buf + wcslen(buf);
+        while (p > buf && p[-1] == L' ') {
+            *--p = L'\0';
+        }
+        wcsncpy(g.cfg.adb, buf, MAX_PATH - 1);
+        g.cfg.adb[MAX_PATH - 1] = L'\0';
+    }
+    ini_save();
+
+    if (g.cfg.scrcpy[0]) {
+        wcsncpy(g.scrcpyPath, g.cfg.scrcpy, MAX_PATH - 1);
+        g.scrcpyPath[MAX_PATH - 1] = L'\0';
+    } else {
+        find_tool(L"scrcpy.exe", NULL, g.scrcpyPath);
+    }
+    if (g.cfg.adb[0]) {
+        wcsncpy(g.adbPath, g.cfg.adb, MAX_PATH - 1);
+        g.adbPath[MAX_PATH - 1] = L'\0';
+        g.adbOk = file_exists(g.adbPath);
+    } else {
+        wchar_t scrcpy_dir[MAX_PATH];
+        scrcpy_dir[0] = L'\0';
+        dir_of(g.scrcpyPath, scrcpy_dir, MAX_PATH);
+        g.adbOk = find_tool(L"adb.exe", scrcpy_dir, g.adbPath);
+    }
+
+    /* restart the device tracker with the (possibly new) adb */
+    track_stop();
+    track_start();
+    wcscpy(g.tipStatus, L"路径已保存并应用");
+}
+
+static void mgr_browse(HWND ctrl)
+{
+    wchar_t file[MAX_PATH] = L"";
+    OPENFILENAMEW ofn;
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = m.frame;
+    ofn.lpstrFilter = L"程序 (*.exe)\0*.exe\0所有文件 (*.*)\0*.*\0";
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrTitle = L"选择程序";
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
+    if (GetOpenFileNameW(&ofn) && ctrl) {
+        SetWindowTextW(ctrl, file);
+    }
+}
+
+static void mgr_add_lv_columns(HWND lv)
+{
+    struct { const wchar_t *t; int w; } cols[] = {
+        { L"状态",   64 },
+        { L"序列号", 150 },
+        { L"型号",   130 },
+        { L"系统",   90 },
+        { L"连接",   64 },
+        { L"电量",   56 },
+    };
+    int i;
+    for (i = 0; i < 6; i++) {
+        LVCOLUMNW c;
+        ZeroMemory(&c, sizeof(c));
+        c.mask = LVCF_TEXT | LVCF_WIDTH;
+        c.pszText = (LPWSTR) cols[i].t;
+        c.cx = MulDiv(cols[i].w, wnd_dpi(m.frame), 96);
+        ListView_InsertColumn(lv, i, &c);
+    }
+}
+
+static void mgr_create_dev_page(HWND page, UINT dpi)
+{
+    wchar_t t[32];
+    m.lv = mkctl(page, WC_LISTVIEWW,
+                 LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS
+                 | LVS_NOSORTHEADER | WS_TABSTOP | WS_BORDER,
+                 NULL, 0, 0, 560, 236, MID_LV, dpi);
+    ListView_SetExtendedListViewStyle(m.lv,
+        LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+    ListView_SetBkColor(m.lv, RGB(32, 32, 32));
+    ListView_SetTextBkColor(m.lv, RGB(32, 32, 32));
+    ListView_SetTextColor(m.lv, RGB(235, 235, 235));
+    mgr_add_lv_columns(m.lv);
+
+    m.refresh = mgr_button(page, dpi, L"刷新", 0, 250, 90, MID_REFRESH);
+    m.connect = mgr_button(page, dpi, L"连接所选", 102, 250, 120,
+                           MID_CONNECT);
+    /* same height as the buttons so the row has one baseline */
+    m.remember = mkctl(page, L"BUTTON", BS_AUTOCHECKBOX | WS_TABSTOP,
+                       L"记住此设备 (serial=)", 244, 250, 216,
+                       MG_BTN_H_96, MID_REMEMBER, dpi);
+    SendMessageW(m.remember, BM_SETCHECK,
+                 g.cfg.serial[0] ? BST_CHECKED : BST_UNCHECKED, 0);
+
+    m.status = mkctl(page, L"STATIC", SS_NOPREFIX | SS_CENTERIMAGE, L"",
+                     0, 294, 560, 40, 0, dpi);
+    m.errview = mkctl(page, L"EDIT",
+                      ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY
+                      | WS_VSCROLL | WS_TABSTOP,
+                      L"", 0, 344, 560, 72, MID_LV + 100, dpi);
+    (void) t;
+}
+
+static void mgr_create_opt_page(HWND page, UINT dpi)
+{
+    wchar_t t[32];
+    int y = 0;
+    mgr_label(page, dpi, L"码率 Mbps（0=默认）", MG_LBL_X_96, y, MG_LBL_W_96);
+    _itow(g.cfg.bitrate, t, 10);
+    m.bitrate = mgr_edit(page, dpi, t, MG_CTL_X_96, y, 80,
+                         ES_NUMBER, MID_BITRATE);
+
+    y += MG_PITCH_96;
+    mgr_label(page, dpi, L"最大尺寸（0=默认）", MG_LBL_X_96, y, MG_LBL_W_96);
+    _itow(g.cfg.max_size, t, 10);
+    m.maxsize = mgr_edit(page, dpi, t, MG_CTL_X_96, y, 80,
+                         ES_NUMBER, MID_MAXSIZE);
+
+    y += MG_PITCH_96;
+    mgr_label(page, dpi, L"最大帧率（0=默认）", MG_LBL_X_96, y, MG_LBL_W_96);
+    _itow(g.cfg.max_fps, t, 10);
+    m.maxfps = mgr_edit(page, dpi, t, MG_CTL_X_96, y, 80,
+                        ES_NUMBER, MID_MAXFPS);
+
+    y += MG_PITCH_96 + 10;
+    m.chkScreenOff = mgr_check(page, dpi, L"息屏镜像", 0, y, 130,
+                               MID_CHK_SCREENOFF);
+    m.chkStayAwake = mgr_check(page, dpi, L"保持唤醒", 140, y, 130,
+                               MID_CHK_STAYAWAKE);
+    m.chkNoAudio = mgr_check(page, dpi, L"禁用音频", 280, y, 130,
+                             MID_CHK_NOAUDIO);
+    m.chkTouch = mgr_check(page, dpi, L"显示触摸点", 420, y, 140,
+                           MID_CHK_TOUCH);
+    SendMessageW(m.chkScreenOff, BM_SETCHECK,
+                 g.cfg.turn_screen_off ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(m.chkStayAwake, BM_SETCHECK,
+                 g.cfg.stay_awake ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(m.chkNoAudio, BM_SETCHECK,
+                 g.cfg.no_audio ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(m.chkTouch, BM_SETCHECK,
+                 g.cfg.show_touches ? BST_CHECKED : BST_UNCHECKED, 0);
+
+    y += MG_PITCH_96 + 4;
+    m.chkReconn = mgr_check(page, dpi, L"断线自动重连", 0, y, 150,
+                            MID_CHK_RECONN);
+    SendMessageW(m.chkReconn, BM_SETCHECK,
+                 g.cfg.auto_reconnect ? BST_CHECKED : BST_UNCHECKED, 0);
+    mgr_label(page, dpi, L"次数", 160, y, 46);
+    _itow(g.cfg.reconnect_attempts, t, 10);
+    m.reconnN = mgr_edit(page, dpi, t, 212, y, 60, ES_NUMBER, MID_RECONN_N);
+    m.chkCloseExit = mgr_check(page, dpi, L"工具栏退出时关闭 scrcpy",
+                               284, y, 276, MID_CHK_CLOSEEXIT);
+    SendMessageW(m.chkCloseExit, BM_SETCHECK,
+                 g.cfg.close_on_exit ? BST_CHECKED : BST_UNCHECKED, 0);
+
+    y += MG_PITCH_96 + 10;
+    mgr_label(page, dpi, L"附加参数（追加到命令行末尾，可覆盖以上选项）:",
+              0, y, 560);
+    y += MG_ROW_H_96 + 6;
+    m.extra = mkctl(page, L"EDIT",
+                    ES_MULTILINE | ES_AUTOHSCROLL | WS_TABSTOP,
+                    g.cfg.scrcpy_args, 0, y, 560, 56, MID_EXTRA, dpi);
+
+    y += 56 + 14;
+    m.optSave = mgr_button(page, dpi, L"保存", 0, y, 110, MID_OPT_SAVE);
+    y += MG_BTN_H_96 + 8;
+    mkctl(page, L"STATIC", SS_NOPREFIX | SS_CENTERIMAGE,
+          L"改动保存后于下次连接生效。",
+          0, y, 560, 24, 0, dpi);
+}
+
+static void mgr_create_path_page(HWND page, UINT dpi)
+{
+    /* every row here shares one 32px height at the same top, so the label,
+     * edit and button boxes line up exactly (one common center line) */
+    HWND lbl;
+    int y = 0;
+    lbl = mkctl(page, L"STATIC", SS_NOPREFIX | SS_CENTERIMAGE,
+                L"scrcpy.exe", MG_LBL_X_96, y, 90, MG_BTN_H_96, 0, dpi);
+    /* semibold: lowercase Latin reads lighter than CJK at the same size */
+    SendMessageW(lbl, WM_SETFONT, (WPARAM) m.fontB, TRUE);
+    m.scrcpyEd = mkctl(page, L"EDIT", ES_AUTOHSCROLL | WS_TABSTOP,
+                       g.cfg.scrcpy[0] ? g.cfg.scrcpy : g.scrcpyPath,
+                       96, y, 398, MG_BTN_H_96, MID_SCRCPY_ED, dpi);
+    m.scrcpyBr = mgr_button(page, dpi, L"浏览", 504, y, 56,
+                            MID_SCRCPY_BR);
+
+    y += MG_PITCH_96;
+    lbl = mkctl(page, L"STATIC", SS_NOPREFIX | SS_CENTERIMAGE,
+                L"adb.exe", MG_LBL_X_96, y, 90, MG_BTN_H_96, 0, dpi);
+    SendMessageW(lbl, WM_SETFONT, (WPARAM) m.fontB, TRUE);
+    m.adbEd = mkctl(page, L"EDIT", ES_AUTOHSCROLL | WS_TABSTOP,
+                    g.cfg.adb[0] ? g.cfg.adb : g.adbPath,
+                    96, y, 398, MG_BTN_H_96, MID_ADB_ED, dpi);
+    m.adbBr = mgr_button(page, dpi, L"浏览", 504, y, 56, MID_ADB_BR);
+
+    y += MG_PITCH_96 + 10;
+    m.detect = mgr_button(page, dpi, L"检测版本", 0, y, 110, MID_DETECT);
+    m.detectOut = mkctl(page, L"STATIC", SS_NOPREFIX | SS_CENTERIMAGE, L"",
+                        122, y, 438, MG_BTN_H_96, 0, dpi);
+
+    y += MG_BTN_H_96 + 16;
+    mkctl(page, L"STATIC", SS_NOPREFIX | SS_CENTERIMAGE,
+          L"留空 = 自动查找（本工具目录 → scrcpy 目录 → PATH）。\n"
+          L"保存后立即生效；更换 adb 会重启设备监测。",
+          0, y, 560, 48, 0, dpi);
+
+    y += 44 + 18;
+    m.pathSave = mgr_button(page, dpi, L"保存并应用", 0, y, 130,
+                            MID_PATH_SAVE);
+}
+
+static void mgr_show_page(int idx)
+{
+    int i;
+    for (i = 0; i < MPAGE_COUNT; i++) {
+        ShowWindow(m.page[i], i == idx ? SW_SHOW : SW_HIDE);
+    }
+}
+
+/* self-drawn tab strip, below the frameless header */
+static void mgr_strip_layout(void)
+{
+    UINT dpi = wnd_dpi(m.frame);
+    int i;
+    RECT cli;
+    GetClientRect(m.frame, &cli);
+    m.hdrRc.left = 0;
+    m.hdrRc.top = 0;
+    m.hdrRc.right = cli.right;
+    m.hdrRc.bottom = MulDiv(42, dpi, 96);
+    m.closeRc.left = cli.right - MulDiv(46, dpi, 96);
+    m.closeRc.top = MulDiv(7, dpi, 96);
+    m.closeRc.right = cli.right - MulDiv(10, dpi, 96);
+    m.closeRc.bottom = MulDiv(37, dpi, 96);
+    for (i = 0; i < MPAGE_COUNT; i++) {
+        int x = 12 + i * MulDiv(138, dpi, 96);
+        m.tabRc[i].left = MulDiv(x, dpi, 96);
+        m.tabRc[i].top = MulDiv(52, dpi, 96);
+        m.tabRc[i].right = m.tabRc[i].left + MulDiv(130, dpi, 96);
+        m.tabRc[i].bottom = m.tabRc[i].top + MulDiv(34, dpi, 96);
+    }
+}
+
+static void mgr_header_paint(HDC dc)
+{
+    UINT dpi = wnd_dpi(m.frame);
+    /* title text, light on dark */
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(235, 235, 235));
+    HGDIOBJ old_f = SelectObject(dc, m.fontB ? m.fontB : g.fUi);
+    RECT tr = m.hdrRc;
+    tr.left += MulDiv(16, dpi, 96);
+    tr.right -= MulDiv(56, dpi, 96);
+    DrawTextW(dc, L"scrdock 管理", -1, &tr,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    /* close cell */
+    RECT rc = m.closeRc;
+    HBRUSH br = CreateSolidBrush(RGB(43, 43, 43));
+    HPEN pen = CreatePen(PS_SOLID, 1, RGB(70, 70, 70));
+    HGDIOBJ old_pen = SelectObject(dc, pen);
+    HGDIOBJ old_br = SelectObject(dc, br);
+    RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, 6, 6);
+    SelectObject(dc, old_br);
+    SelectObject(dc, old_pen);
+    DeleteObject(pen);
+    DeleteObject(br);
+    SetTextColor(dc, RGB(240, 240, 240));
+    if (g.glyphsOk) {
+        SelectObject(dc, g.fGlyph);
+        DrawTextW(dc, L"\uE8BB", -1, &rc,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    } else {
+        DrawTextW(dc, L"X", -1, &rc,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+    SelectObject(dc, old_f);
+}
+
+static void mgr_strip_paint(HDC dc)
+{
+    static const wchar_t *names[MPAGE_COUNT] = {
+        L"设备", L"参数", L"路径"
+    };
+    int i;
+    for (i = 0; i < MPAGE_COUNT; i++) {
+        RECT rc = m.tabRc[i];
+        bool active = (i == m.tabSel);
+        HBRUSH br = CreateSolidBrush(active ? RGB(44, 96, 160)
+                                            : RGB(43, 43, 43));
+        HPEN pen = CreatePen(PS_SOLID, 1, active ? RGB(70, 120, 180)
+                                                 : RGB(70, 70, 70));
+        HGDIOBJ old_pen = SelectObject(dc, pen);
+        HGDIOBJ old_br = SelectObject(dc, br);
+        RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, 6, 6);
+        SelectObject(dc, old_br);
+        SelectObject(dc, old_pen);
+        DeleteObject(pen);
+        DeleteObject(br);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(240, 240, 240));
+        HGDIOBJ old_f = SelectObject(dc, m.font ? m.font : g.fUi);
+        DrawTextW(dc, names[i], -1, &rc,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SelectObject(dc, old_f);
+    }
+}
+
+static void mgr_switch_page(int idx)
+{
+    if (idx < 0 || idx >= MPAGE_COUNT || !m.frame) {
+        return;
+    }
+    m.tabSel = idx;
+    mgr_show_page(idx);
+    InvalidateRect(m.frame, NULL, FALSE);
+}
+
+static LRESULT CALLBACK mgr_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT:
+        {
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(hwnd, &ps);
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            HBRUSH br = CreateSolidBrush(RGB(32, 32, 32));
+            FillRect(dc, &rc, br);
+            DeleteObject(br);
+            mgr_header_paint(dc);
+            mgr_strip_paint(dc);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+    case WM_NCHITTEST:
+        {
+            /* frameless: the header acts as the caption (dragging), except
+             * the close cell which stays a normal click target */
+            POINT pt;
+            pt.x = GET_X_LPARAM(lp);
+            pt.y = GET_Y_LPARAM(lp);
+            ScreenToClient(hwnd, &pt);
+            if (PtInRect(&m.closeRc, pt)) {
+                return HTCLIENT;
+            }
+            if (PtInRect(&m.hdrRc, pt)) {
+                return HTCAPTION;
+            }
+        }
+        break;
+    case WM_LBUTTONDOWN:
+        {
+            POINT pt;
+            pt.x = GET_X_LPARAM(lp);
+            pt.y = GET_Y_LPARAM(lp);
+            if (PtInRect(&m.closeRc, pt)) {
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            int i;
+            for (i = 0; i < MPAGE_COUNT; i++) {
+                if (PtInRect(&m.tabRc[i], pt)) {
+                    mgr_switch_page(i);
+                    break;
+                }
+            }
+        }
+        return 0;
+    case WM_NOTIFY:
+        {
+            NMHDR *nm = (NMHDR *) lp;
+            if (nm->idFrom == MID_LV && nm->code == NM_DBLCLK) {
+                mgr_connect_selected();
+                return 0;
+            }
+        }
+        return 0;
+    case WM_COMMAND:
+        switch (LOWORD(wp)) {
+        case MID_REFRESH:
+            meta_spawn();
+            break;
+        case MID_CONNECT:
+            mgr_connect_selected();
+            break;
+        case MID_OPT_SAVE:
+            mgr_opt_save();
+            mgr_update_status();
+            break;
+        case MID_PATH_SAVE:
+            mgr_path_save();
+            mgr_refresh();
+            break;
+        case MID_DETECT:
+            {
+                uintptr_t th = _beginthreadex(NULL, 0, detect_thread,
+                                              NULL, 0, NULL);
+                if (th) {
+                    CloseHandle((HANDLE) th);
+                }
+            }
+            break;
+        case MID_SCRCPY_BR:
+            mgr_browse(m.scrcpyEd);
+            break;
+        case MID_ADB_BR:
+            mgr_browse(m.adbEd);
+            break;
+        default:
+            break;
+        }
+        return 0;
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY:
+        if (m.brBg) {
+            DeleteObject(m.brBg);
+        }
+        if (m.brEdit) {
+            DeleteObject(m.brEdit);
+        }
+        if (m.font) {
+            DeleteObject(m.font);
+        }
+        if (m.fontB) {
+            DeleteObject(m.fontB);
+        }
+        ZeroMemory(&m, sizeof(m));
+        /* boot-failure state: the toolbar never docked and there is no
+         * scrcpy session left — closing the manager should not leave a
+         * hidden zombie holding the single-instance mutex */
+        if (g.hwnd && !g.everDocked && !g.hProc) {
+            DestroyWindow(g.hwnd);
+        }
+        return 0;
+    default:
+        break;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void mgr_open(void)
+{
+    if (m.frame && IsWindow(m.frame)) {
+        ShowWindow(m.frame, SW_RESTORE);
+        SetForegroundWindow(m.frame);
+        mgr_refresh();
+        return;
+    }
+
+    UINT dpi = wnd_dpi(g.hwnd);
+    m.tabSel = MPAGE_DEV;
+    m.brBg = CreateSolidBrush(RGB(32, 32, 32));
+    m.brEdit = CreateSolidBrush(RGB(43, 43, 43));
+    m.font = mgr_font_make(false, dpi);   /* 10.5pt */
+    m.fontB = mgr_font_make(true, dpi);
+
+    WNDCLASSW wc;
+    ZeroMemory(&wc, sizeof(wc));
+    wc.lpfnWndProc = mgr_wndproc;
+    wc.hInstance = g_hInst;
+    wc.lpszClassName = L"scrdock_mgr_cls";
+    wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    wc.hIcon = LoadIconW(g_hInst, MAKEINTRESOURCEW(1));
+    RegisterClassW(&wc); /* already-registered is fine */
+
+    WNDCLASSW wpCls;
+    ZeroMemory(&wpCls, sizeof(wpCls));
+    wpCls.lpfnWndProc = mgr_page_proc;
+    wpCls.hInstance = g_hInst;
+    wpCls.lpszClassName = L"scrdock_mgrpage_cls";
+    RegisterClassW(&wpCls); /* no background brush: page paints itself */
+
+    /* frameless floating window: self-drawn header (title + close), no
+     * system caption — a dark native title bar keeps near-black caption
+     * text on some Windows builds, so it is not used at all. Opened next
+     * to the toolbar so it lands on the same monitor (same DPI). */
+    DWORD style = WS_POPUP | WS_MINIMIZEBOX;
+    int mx = CW_USEDEFAULT;
+    int my = CW_USEDEFAULT;
+    int mw = MulDiv(MGR_W_96, dpi, 96);
+    int mh = MulDiv(MGR_H_96, dpi, 96);
+    {
+        RECT tr;
+        if (g.hwnd && GetWindowRect(g.hwnd, &tr)) {
+            HMONITOR mon = MonitorFromWindow(g.hwnd,
+                                             MONITOR_DEFAULTTONEAREST);
+            MONITORINFO mi;
+            mi.cbSize = sizeof(mi);
+            if (GetMonitorInfoW(mon, &mi)) {
+                mx = tr.right + MulDiv(16, dpi, 96);
+                my = tr.top;
+                if (mx + mw > mi.rcWork.right) {
+                    mx = mi.rcWork.right - mw;
+                }
+                if (my + mh > mi.rcWork.bottom) {
+                    my = mi.rcWork.bottom - mh;
+                }
+                if (mx < mi.rcWork.left) {
+                    mx = mi.rcWork.left;
+                }
+                if (my < mi.rcWork.top) {
+                    my = mi.rcWork.top;
+                }
+            }
+        }
+    }
+    m.frame = CreateWindowExW(0, L"scrdock_mgr_cls", L"scrdock 管理", style,
+                              mx, my, mw, mh,
+                              g.hwnd, NULL, g_hInst, NULL);
+    if (!m.frame) {
+        return;
+    }
+    mgr_dark_titlebar(m.frame);
+    mgr_strip_layout();
+
+    int i;
+    for (i = 0; i < MPAGE_COUNT; i++) {
+        m.page[i] = CreateWindowExW(0, L"scrdock_mgrpage_cls", L"",
+                                    WS_CHILD, 0, 0, 0, 0,
+                                    m.frame, NULL, g_hInst, NULL);
+    }
+    mgr_create_dev_page(m.page[MPAGE_DEV], dpi);
+    mgr_create_opt_page(m.page[MPAGE_OPT], dpi);
+    mgr_create_path_page(m.page[MPAGE_PATH], dpi);
+
+    /* pages fill the area below the header and tab strip */
+    int px = MulDiv(12, dpi, 96);
+    int py = MulDiv(94, dpi, 96);
+    int pw = MulDiv(MGR_W_96 - 24, dpi, 96);
+    int ph = MulDiv(MGR_H_96 - 106, dpi, 96);
+    for (i = 0; i < MPAGE_COUNT; i++) {
+        SetWindowPos(m.page[i], NULL, px, py, pw, ph,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    mgr_show_page(MPAGE_DEV);
+
+    ShowWindow(m.frame, SW_SHOW);
+    mgr_refresh();
+}
+
+static void mgr_toggle(void)
+{
+    if (m.frame && IsWindow(m.frame)) {
+        DestroyWindow(m.frame);
+    } else {
+        mgr_open();
     }
 }
 
@@ -1322,6 +2892,10 @@ static void button_fire(int id)
         InvalidateRect(g.hwnd, NULL, FALSE);
         return;
     }
+    if (id == ID_MGR) {
+        mgr_toggle();
+        return;
+    }
     if (!g.adbOk && !use_shortcut_controls()) {
         return;
     }
@@ -1396,18 +2970,76 @@ static void button_fire(int id)
 
 static void show_menu(HWND hwnd, int x, int y)
 {
-    HMENU m = CreatePopupMenu();
-    if (!m) {
+    HMENU menu = CreatePopupMenu();
+    if (!menu) {
         return;
     }
-    AppendMenuW(m, MF_STRING, IDM_REDOCK, L"重新吸附 (&D)");
-    AppendMenuW(m, MF_STRING, IDM_EXIT, L"退出 (&X)");
+    AppendMenuW(menu, MF_STRING, IDM_REDOCK, L"重新吸附 (&D)");
+    AppendMenuW(menu, MF_STRING, IDM_EXIT, L"退出 (&X)");
     /* Tray-icon trick: popup menus dismiss correctly only for a foreground
      * window; briefly foreground, then release via the WM_NULL nudge. */
     SetForegroundWindow(hwnd);
-    TrackPopupMenu(m, TPM_RIGHTBUTTON, x, y, 0, hwnd, NULL);
+    TrackPopupMenu(menu, TPM_RIGHTBUTTON, x, y, 0, hwnd, NULL);
     PostMessageW(hwnd, WM_NULL, 0, 0);
-    DestroyMenu(m);
+    DestroyMenu(menu);
+}
+
+/* ------------------------------------------------------------------ */
+/* device-list application + reconnect                                 */
+
+static void reconn_arm(void)
+{
+    SetTimer(g.hwnd, TIMER_RECONN, 1500, NULL);
+}
+
+/* UI-thread application of a fresh device snapshot (takes ownership). */
+static void devlist_apply(struct DevList *dl)
+{
+    if (!dl) {
+        return;
+    }
+    struct DevList *old = g.devList;
+    bool changed = !old || old->count != dl->count
+        || memcmp(old->v, dl->v,
+                  sizeof(struct DevInfo) * (size_t) dl->count) != 0;
+    g.devList = dl;
+    free(old);
+
+    /* Selection: a pinned serial (serial= in ini) always wins. In auto
+     * mode, follow the first online device whenever ours disappears —
+     * exactly one device attached means "just works" like before. */
+    if (!g.cfg.serial[0] && !dev_online(g.serial)) {
+        int i;
+        g.serial[0] = L'\0';
+        for (i = 0; i < g.devList->count; i++) {
+            if (wcscmp(g.devList->v[i].state, L"device") == 0) {
+                wcsncpy(g.serial, g.devList->v[i].serial, 127);
+                g.serial[127] = L'\0';
+                break;
+            }
+        }
+    }
+    g.devNone = (dev_count_online() == 0);
+
+    if (g.bootLaunch) {
+        /* first snapshot: the serial is resolved, so launch with -s */
+        g.bootLaunch = false;
+        if (!launch_scrcpy()) {
+            swprintf(g.tipStatus, MAX_PATH + 32,
+                     L"启动 scrcpy 失败 (code %lu)", GetLastError());
+            mgr_open();
+        }
+    }
+
+    /* the device came back while we were waiting to reconnect */
+    if (g.reconnPending && !g.hProc && dev_online(g.serial)) {
+        reconn_arm();
+    }
+    if (changed || g.devMeta.count == 0) {
+        meta_spawn();
+    }
+    mgr_refresh();
+    InvalidateRect(g.hwnd, NULL, FALSE);
 }
 
 static void teardown(HWND hwnd)
@@ -1421,6 +3053,14 @@ static void teardown(HWND hwnd)
     KillTimer(hwnd, TIMER_SYNC);
     KillTimer(hwnd, TIMER_FLASH);
     KillTimer(hwnd, TIMER_TIP);
+    KillTimer(hwnd, TIMER_RECONN);
+    if (g.hTrack) {
+        track_stop(); /* a poller stuck inside adb is cut by process exit */
+    }
+    if (g.hErr) {
+        CloseHandle(g.hErr);
+        g.hErr = NULL;
+    }
     if (g.fGlyph) {
         DeleteObject(g.fGlyph);
         g.fGlyph = NULL;
@@ -1429,7 +3069,9 @@ static void teardown(HWND hwnd)
         DeleteObject(g.fUi);
         g.fUi = NULL;
     }
-    close_scrcpy_and_wait();
+    if (g.cfg.close_on_exit) {
+        close_scrcpy_and_wait();
+    }
     PostQuitMessage(0);
 }
 
@@ -1613,15 +3255,16 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (g.target && !IsWindow(g.target)) {
                 hunting_start();
             }
-            if (!g.hProc) {
-                /* attach mode without a handle: poll for process exit */
-                if (!find_scrcpy_pid()) {
+            if (g.hErr) {
+                err_drain(false); /* keep the pipe from filling up */
+            }
+            if (!g.hProc && !g.launched) {
+                /* attach mode without a handle: poll for process exit
+                 * (a launched child is handled via WM_APP_PROCEXIT) */
+                if (g.pid && !find_scrcpy_pid()) {
                     DestroyWindow(hwnd);
                     return 0;
                 }
-            } else if (WaitForSingleObject(g.hProc, 0) == WAIT_OBJECT_0) {
-                DestroyWindow(hwnd);
-                return 0;
             }
             dock_reposition(false);
             break;
@@ -1636,17 +3279,119 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 tip_show(g.hover);
             }
             break;
+        case TIMER_RECONN:
+            KillTimer(hwnd, TIMER_RECONN);
+            if (!g.reconnPending || g.hProc) {
+                break;
+            }
+            if (!dev_online(g.serial)) {
+                break; /* still gone; WM_APP_DEVLIST re-arms when it's back */
+            }
+            if (g.reconnAttempts >= g.cfg.reconnect_attempts) {
+                g.reconnPending = false;
+                wcscpy(g.tipStatus, L"重连次数已用完，请打开管理窗口手动连接");
+                mgr_refresh();
+                break;
+            }
+            g.reconnAttempts++;
+            if (launch_scrcpy()) {
+                swprintf(g.tipStatus, MAX_PATH + 32, L"已重连 (%d/%d)",
+                         g.reconnAttempts, g.cfg.reconnect_attempts);
+            } else {
+                swprintf(g.tipStatus, MAX_PATH + 32,
+                         L"重连失败: 无法启动 scrcpy (code %lu)",
+                         GetLastError());
+            }
+            mgr_refresh();
+            InvalidateRect(hwnd, NULL, FALSE);
+            break;
         default:
             break;
         }
         return 0;
 
-    case WM_APP_DEVREADY:
-        g.devNone = (wp == 0);
-        if (wp == 2 && !g.cfg.serial[0]) {
-            dbg_log(L"multiple devices attached; set serial= in scrdock.ini");
+    case WM_APP_DEVLIST:
+        devlist_apply((struct DevList *) wp);
+        return 0;
+
+    case WM_APP_DEVMETA:
+        {
+            struct DevMetaBatch *mb = (struct DevMetaBatch *) wp;
+            if (mb) {
+                if (mb->scrW > 0 && mb->scrH > 0) {
+                    g.scrW = mb->scrW;
+                    g.scrH = mb->scrH;
+                }
+                g.devMeta = *mb;
+                free(mb);
+            }
+            g.metaBusy = false;
+            if (g.metaPending) {
+                g.metaPending = false;
+                meta_spawn();
+            }
+            mgr_refresh();
         }
-        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+
+    case WM_APP_DETECTED:
+        {
+            wchar_t *txt = (wchar_t *) wp;
+            if (txt) {
+                if (m.detectOut && IsWindow(m.detectOut)) {
+                    SetWindowTextW(m.detectOut, txt);
+                }
+                free(txt);
+            }
+        }
+        return 0;
+
+    case WM_APP_PROCEXIT:
+        {
+            if (g.closing || (unsigned) lp != g.procGen) {
+                return 0; /* stale message from a previous child */
+            }
+            DWORD code = (DWORD) wp;
+            err_drain(true);
+            if (code != 0) {
+                err_last_line(g.errLine, 256);
+            }
+            if (!g.launched) {
+                /* attached (foreign) instance: follow it out, as before */
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            g.target = NULL;
+            /* scrcpy exit codes: 0 = closed, 1 = startup failure,
+             * 2 = device disconnected while running */
+            if (code == 2 && g.cfg.auto_reconnect
+                    && g.reconnAttempts < g.cfg.reconnect_attempts) {
+                if (GetTickCount64() - g.launchTick > 10000) {
+                    g.reconnAttempts = 0; /* stable session: fresh budget */
+                }
+                g.reconnPending = true;
+                swprintf(g.tipStatus, MAX_PATH + 32, L"设备断开，重连中 (%d/%d)",
+                         g.reconnAttempts + 1, g.cfg.reconnect_attempts);
+                if (dev_online(g.serial)) {
+                    reconn_arm();
+                }
+                mgr_refresh();
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            if (code == 0) {
+                DestroyWindow(hwnd); /* user closed the scrcpy window */
+                return 0;
+            }
+            /* failed (and not reconnecting): stay alive, surface the error */
+            swprintf(g.tipStatus, MAX_PATH + 32, L"scrcpy 已退出 (code %lu)",
+                     code);
+            if (!g.everDocked) {
+                mgr_open(); /* e.g. boot failure: the manager shows why */
+            }
+            mgr_refresh();
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
         return 0;
 
     case WM_APP_SHOTDONE:
@@ -1681,16 +3426,28 @@ static int run_loop(void)
                                               INFINITE, QS_ALLINPUT,
                                               MWMO_INPUTAVAILABLE);
         if (g.hProc && r == WAIT_OBJECT_0) {
-            break; /* scrcpy exited */
+            /* scrcpy exited: hand the exit code to the UI thread. Staying
+             * alive (error display, reconnect) is decided in WM_APP_PROCEXIT;
+             * procGen tags the message so a relaunched child never sees a
+             * stale exit. */
+            DWORD code = 0;
+            GetExitCodeProcess(g.hProc, &code);
+            if (g.hwnd) {
+                PostMessageW(g.hwnd, WM_APP_PROCEXIT, (WPARAM) code,
+                             (LPARAM) g.procGen);
+            }
+            CloseHandle(g.hProc);
+            g.hProc = NULL;
+            continue;
         }
         if (r == WAIT_OBJECT_0 + (g.hProc ? 1u : 0u)) {
-            MSG m;
-            while (PeekMessageW(&m, NULL, 0, 0, PM_REMOVE)) {
-                if (m.message == WM_QUIT) {
-                    return (int) m.wParam;
+            MSG msg;
+            while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+                if (msg.message == WM_QUIT) {
+                    return (int) msg.wParam;
                 }
-                TranslateMessage(&m);
-                DispatchMessageW(&m);
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
             }
         } else if (r == WAIT_FAILED) {
             break;
@@ -1732,6 +3489,11 @@ int WINAPI wWinMain(HINSTANCE h_inst, HINSTANCE h_prev, PWSTR cmd_line,
 
     init_dpi();
 
+    INITCOMMONCONTROLSEX icc;
+    icc.dwSize = sizeof(icc);
+    icc.dwICC = ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES | ICC_STANDARD_CLASSES;
+    InitCommonControlsEx(&icc);
+
     SetLastError(0);
     CreateMutexW(NULL, TRUE, L"Local\\scrdock_single");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -1752,30 +3514,17 @@ int WINAPI wWinMain(HINSTANCE h_inst, HINSTANCE h_prev, PWSTR cmd_line,
     g.hover = g.pressed = g.flashBtn = -1;
     g.tipShownFor = -1;
 
-    bool have_scrcpy = find_tool(L"scrcpy.exe", NULL, g.scrcpyPath);
-    g.pid = find_scrcpy_pid();
-
-    if (g.pid) {
-        /* Attach to the running instance; keep it alive on toolbar close. */
-        g.hProc = OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE
-                              | PROCESS_QUERY_LIMITED_INFORMATION,
-                              FALSE, g.pid);
-        g.launched = false;
+    bool have_scrcpy;
+    if (g.cfg.scrcpy[0] && file_exists(g.cfg.scrcpy)) {
+        wcsncpy(g.scrcpyPath, g.cfg.scrcpy, MAX_PATH - 1);
+        g.scrcpyPath[MAX_PATH - 1] = L'\0';
+        have_scrcpy = true;
     } else {
-        if (!have_scrcpy) {
-            MessageBoxW(NULL,
-                        L"未找到 scrcpy.exe：\n"
-                        L"请把 scrdock.exe 放到 scrcpy 所在目录，\n"
-                        L"或确保 scrcpy 在 PATH 中。",
-                        L"scrdock", MB_ICONERROR);
-            return 1;
-        }
-        if (!launch_scrcpy()) {
-            MessageBoxW(NULL, L"启动 scrcpy 失败。", L"scrdock", MB_ICONERROR);
-            return 1;
-        }
+        have_scrcpy = find_tool(L"scrcpy.exe", NULL, g.scrcpyPath);
     }
 
+    /* resolve adb BEFORE launching: the boot launch wants -s <serial>,
+     * which is only known after the first track-devices snapshot */
     if (g.cfg.adb[0]) {
         wcsncpy(g.adbPath, g.cfg.adb, MAX_PATH - 1);
         g.adbPath[MAX_PATH - 1] = L'\0';
@@ -1793,27 +3542,50 @@ int WINAPI wWinMain(HINSTANCE h_inst, HINSTANCE h_prev, PWSTR cmd_line,
         g.serial[127] = L'\0';
     }
 
+    g.pid = find_scrcpy_pid();
+    if (g.pid) {
+        /* Attach to the running instance; keep it alive on toolbar close. */
+        g.hProc = OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE
+                              | PROCESS_QUERY_LIMITED_INFORMATION,
+                              FALSE, g.pid);
+        g.launched = false;
+    } else if (!have_scrcpy) {
+            MessageBoxW(NULL,
+                        L"未找到 scrcpy.exe：\n"
+                        L"请把 scrdock.exe 放到 scrcpy 所在目录，\n"
+                        L"或确保 scrcpy 在 PATH 中。",
+                        L"scrdock", MB_ICONERROR);
+            return 1;
+    } else if (g.adbOk) {
+        /* adb known: wait for the first device snapshot, then launch with
+         * -s <serial> (see devlist_apply) */
+        g.bootLaunch = true;
+    } else if (!launch_scrcpy()) {
+            MessageBoxW(NULL, L"启动 scrcpy 失败。", L"scrdock", MB_ICONERROR);
+            return 1;
+    }
+
     register_and_create();
     if (!g.hwnd) {
         return 1;
     }
 
-    hooks_install(g.pid);
     SetTimer(g.hwnd, TIMER_SYNC, 500, NULL);
 
-    HWND t = find_scrcpy_window(g.pid);
-    if (t) {
-        adopt_target(t);
-    } else {
-        hunting_start();
+    if (g.pid) {
+        /* attach mode: hook and hunt the existing window (a launched child
+         * installs its own hooks inside launch_scrcpy) */
+        hooks_install(g.pid);
+        HWND t = find_scrcpy_window(g.pid);
+        if (t) {
+            adopt_target(t);
+        } else {
+            hunting_start();
+        }
     }
 
     if (g.adbOk) {
-        uintptr_t th = _beginthreadex(NULL, 0, device_probe_thread, NULL,
-                                      0, NULL);
-        if (th) {
-            CloseHandle((HANDLE) th);
-        }
+        track_start();
     }
 
     int rc = run_loop();

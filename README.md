@@ -25,7 +25,26 @@
 | ⚙ | 展开控制中心 | adb 直开（单开，不连带通知栏） | cmd statusbar expand-settings |
 | 📌 | 窗口置顶开关（scrcpy + 工具栏一起置顶/取消） | HWND_TOPMOST | — |
 | 📷 | 截图 → `%USERPROFILE%\Pictures\scrdock\` | adb exec-out | — |
+| ⋯ | **管理窗口**：设备 / 参数 / 路径 三页 | — | — |
 | ✕ | 关闭工具栏（默认同时退出 scrcpy） | — | — |
+
+## 管理窗口（⋯ 按钮）
+
+- **设备页**：1.5 秒轮询 `adb devices`（仅变化时刷新，插拔/授权约 1~2 秒内反映），
+  列出状态（在线/离线/待授权）、序列号、型号、Android 版本、连接类型、电量；
+  选中一行 → **连接所选**（双击同效）即切换目标并重启 scrcpy；勾选
+  **记住此设备** 则把 `serial=` 写进 ini（不勾 = 自动模式：跟随唯一在线设备）。
+  底部显示 scrcpy 运行状态和 **stderr 尾部输出**——启动失败（如多设备冲突、
+  未授权）的原因直接可见，不再静默消失。
+- **参数页**：码率 / 最大尺寸 / 最大帧率 / 息屏镜像 / 保持唤醒 / 禁用音频 /
+  显示触摸点 做成控件；`scrcpy_args` 保留为"附加参数"追加在末尾（可覆盖前者）；
+  断线自动重连及其次数；关闭工具栏时是否退出 scrcpy。
+- **路径页**：scrcpy.exe / adb.exe 路径（留空 = 自动查找：同目录 → scrcpy 目录
+  → PATH），检测版本按钮，保存后立即生效（更换 adb 会重启设备监测）。
+
+**断线自动重连**（默认开，5 次）：scrcpy 以退出码 2 结束（设备断开）时，等设备
+重新出现在 `adb devices` 后自动带 `-s` 重拉；会话稳定超过 10 秒则重置次数。
+启动失败（退出码 1）不重连，工具栏保持存活并在管理窗口显示错误。
 
 ## 交互
 
@@ -44,7 +63,8 @@
 钩子以 `WINEVENT_OUTOFCONTEXT` 安装在跑消息循环的 UI 线程上，事件由系统
 编组进该线程的队列、在泵消息时回调——**回调与消息循环同线程，绝不跨线程**。
 主循环用 `MsgWaitForMultipleObjectsEx(MWMO_INPUTAVAILABLE)` 同时等
-scrcpy 进程句柄和消息：scrcpy 退出 → 工具栏自动退出，全程消息不断流。
+scrcpy 进程句柄和消息：scrcpy 退出 → 投递 `WM_APP_PROCEXIT`（带退出码
+与进程代号），正常关闭即退出工具栏，异常退出则显示错误/触发重连，全程消息不断流。
 
 事件集：`EVENT_OBJECT_LOCATIONCHANGE`（移动+缩放都会触发）、
 `EVENT_OBJECT_SHOW`（SDL 窗口首帧显示）、`EVENT_OBJECT_DESTROY`、
@@ -57,9 +77,11 @@ scrcpy 进程句柄和消息：scrcpy 退出 → 工具栏自动退出，全程�
 
 ```ini
 [scrdock]
-; 多设备时指定序列号（单设备可省略）
+; 多设备时指定序列号（空 = 自动模式：跟随唯一在线设备；管理窗口可写）
 serial=6e52b59e
-; 附加传给 scrcpy 的参数（原样追加，如 --max-size=800）
+; 显式 scrcpy.exe 路径（默认: 同目录 → PATH 自动查找）
+scrcpy=D:\Tools\scrcpy\scrcpy.exe
+; 附加传给 scrcpy 的参数（原样追加在末尾，可覆盖结构化选项）
 scrcpy_args=--stay-awake
 ; 自定义 adb.exe 路径（默认: 同目录 → scrcpy 目录 → PATH）
 adb=D:\platform-tools\adb.exe
@@ -68,7 +90,21 @@ close_scrcpy_on_exit=1
 ; 控制通道: auto(默认: 自启动用快捷键, 附着用 adb) | shortcut | adb
 ; 注意:附着的外部实例若改过 --shortcut-mod,请用 adb
 control=auto
+; —— 结构化参数（管理窗口"参数页"生成，0/缺省 = 不传给 scrcpy）——
+bitrate=8          ; 视频码率 Mbps（--video-bit-rate=8M）
+max_size=0         ; --max-size
+max_fps=0          ; --max-fps
+turn_screen_off=0  ; --turn-screen-off（息屏镜像）
+stay_awake=0       ; --stay-awake
+no_audio=0         ; --no-audio
+show_touches=0     ; --show-touches
+; 断线自动重连（默认 1 = 开）
+auto_reconnect=1
+reconnect_attempts=5
 ```
+
+以上键均可由管理窗口读写；手改 ini 与管理窗口互不冲突（保存时按"空值删键"
+原则只落非默认项）。
 
 注意：ini 按 ANSI 解析，值请用 ASCII（序列号/路径本来就是 ASCII）。
 
@@ -82,7 +118,7 @@ build.bat                          :: 产物 build\scrdock.exe
 build.bat D:\path\to\scrcpy\dist   :: 编译并复制到 scrcpy 目录
 ```
 
-零外部依赖：只链 user32/gdi32/kernel32/shell32/advapi32。
+零外部依赖：只链 user32/gdi32/kernel32/shell32/advapi32/comctl32/comdlg32。
 
 ## 图标与资源
 
@@ -97,6 +133,7 @@ build.bat D:\path\to\scrcpy\dist   :: 编译并复制到 scrcpy 目录
 - 电源键（26）是真实电源键：会灭屏（镜像继续）
 - ini 值为 ANSI；截图目录固定在 `Pictures\scrdock`
 - 同一时间只允许一个 scrdock 实例（互斥体）
-- 检测到多个 scrcpy.exe 时附着最新的那个；多个 Android 设备时建议在
-  ini 里写死 serial
+- 检测到多个 scrcpy.exe 时附着最新的那个；多设备时用管理窗口选择
+  （拉起的 scrcpy 总是带 `-s <序列号>`，绝不连错设备）
+- 单实例单投屏：一次只管理一路 scrcpy 会话（多开是后续计划）
 
