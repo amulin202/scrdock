@@ -59,6 +59,7 @@
 #define WM_APP_SHOTDONE (WM_APP + 3)
 #define WM_APP_PROCEXIT (WM_APP + 4)  /* wp: exit code, lp: proc gen   */
 #define WM_APP_DETECTED (WM_APP + 5)  /* wp: heap wchar[] text         */
+#define WM_APP_WIFIDONE (WM_APP + 6)  /* wp: heap WifiResult*          */
 
 #define TIMER_HUNT  1  /* 200 ms: poll for the scrcpy window            */
 #define TIMER_SYNC  2  /* 500 ms: safety net (missed events, pid polls) */
@@ -127,6 +128,7 @@ struct DevMeta {
     wchar_t model[64];
     wchar_t android[16];
     int battery;             /* percent, -1 = unknown */
+    wchar_t ip[20];          /* wlan address of USB devices, empty = n/a */
 };
 
 struct DevMetaBatch {
@@ -151,6 +153,7 @@ struct Config {
     BOOL show_touches;
     BOOL auto_reconnect;
     int reconnect_attempts;
+    BOOL wireless;           /* launch with --tcpip (USB -> WiFi switch) */
 };
 
 struct Scrdock {
@@ -322,6 +325,7 @@ static void ini_load(void)
     g.cfg.show_touches = FALSE;
     g.cfg.auto_reconnect = TRUE;
     g.cfg.reconnect_attempts = 5;
+    g.cfg.wireless = FALSE;
 
     if (!file_exists(ini)) {
         return;
@@ -364,6 +368,8 @@ static void ini_load(void)
         GetPrivateProfileIntA("scrdock", "auto_reconnect", 1, ini_a) != 0;
     g.cfg.reconnect_attempts =
         GetPrivateProfileIntA("scrdock", "reconnect_attempts", 5, ini_a);
+    g.cfg.wireless =
+        GetPrivateProfileIntA("scrdock", "wireless", 0, ini_a) != 0;
 }
 
 /* Persist the config. Called on the UI thread only (manager buttons and
@@ -416,6 +422,8 @@ static void ini_save(void)
                                g.cfg.auto_reconnect ? "1" : "0", ini_a);
     _itoa(g.cfg.reconnect_attempts, val, 10);
     WritePrivateProfileStringA("scrdock", "reconnect_attempts", val, ini_a);
+    WritePrivateProfileStringA("scrdock", "wireless",
+                               g.cfg.wireless ? "1" : NULL, ini_a);
 }
 
 static UINT wnd_dpi(HWND hwnd)
@@ -552,6 +560,10 @@ static void build_scrcpy_cmd(wchar_t *cmd, size_t cch)
     }
     if (g.cfg.show_touches) {
         cmd_catf(cmd, cch, &n, L" --show-touches");
+    }
+    if (g.cfg.wireless && (!g.serial[0] || !wcschr(g.serial, L':'))) {
+        /* USB -> WiFi switch; on an ip:port serial it would be redundant */
+        cmd_catf(cmd, cch, &n, L" --tcpip");
     }
     if (g.cfg.scrcpy_args[0]) {
         cmd_catf(cmd, cch, &n, L" %s", g.cfg.scrcpy_args);
@@ -1181,6 +1193,138 @@ static int meta_battery(const wchar_t *serial)
     return -1;
 }
 
+/* wlan address of a USB-connected device: parse "src <ip>" from ip route */
+static void meta_ip(const wchar_t *serial, wchar_t *out, size_t cch)
+{
+    wchar_t cmd[MAX_PATH + 96];
+    char buf[1024];
+    DWORD ec = 0;
+    out[0] = L'\0';
+    swprintf(cmd, MAX_PATH + 96, L"\"%s\" -s %s shell ip route",
+             g.adbPath, serial);
+    if (!capture_sync(cmd, buf, sizeof(buf), 8000, &ec)) {
+        return;
+    }
+    const char *p = strstr(buf, " src ");
+    if (!p) {
+        return;
+    }
+    p += 5;
+    char ip[24];
+    int i = 0;
+    while (p[i] && p[i] != ' ' && p[i] != '\r' && p[i] != '\n'
+            && i < (int) sizeof(ip) - 1) {
+        ip[i] = p[i];
+        i++;
+    }
+    ip[i] = '\0';
+    if (i >= 7) { /* shortest "x.x.x.x" */
+        MultiByteToWideChar(CP_ACP, 0, ip, -1, out, (int) cch - 1);
+    }
+}
+
+/* ---- remembered WiFi addresses ([devices] ini section) ---- */
+
+struct WifiMap {
+    wchar_t serial[64];      /* USB serial                             */
+    wchar_t ip[24];          /* last known wlan address                */
+};
+
+static struct WifiMap g_wifiMap[DEV_MAX];
+
+static void wifi_map_load(void)
+{
+    char buf[4096];
+    wchar_t ini[MAX_PATH];
+    char ini_a[MAX_PATH];
+    swprintf(ini, MAX_PATH, L"%s\\scrdock.ini", g.exeDir);
+    WideCharToMultiByte(CP_ACP, 0, ini, -1, ini_a, MAX_PATH, NULL, NULL);
+    if (!file_exists(ini)) {
+        return;
+    }
+    ZeroMemory(buf, sizeof(buf));
+    GetPrivateProfileSectionA("devices", buf, sizeof(buf), ini_a);
+    char *p = buf;
+    int n = 0;
+    while (*p && n < DEV_MAX) {
+        char *eq = strchr(p, '=');
+        if (eq) {
+            *eq = '\0';
+            MultiByteToWideChar(CP_ACP, 0, p, -1,
+                                g_wifiMap[n].serial, 64);
+            MultiByteToWideChar(CP_ACP, 0, eq + 1, -1,
+                                g_wifiMap[n].ip, 24);
+            n++;
+            *eq = '=';
+        }
+        p += strlen(p) + 1;
+    }
+}
+
+static void wifi_map_set(const wchar_t *serial, const wchar_t *ip)
+{
+    int i;
+    if (!serial[0] || !ip[0] || wcschr(serial, L':')) {
+        return; /* only map USB serials */
+    }
+    for (i = 0; i < DEV_MAX; i++) {
+        if (g_wifiMap[i].serial[0]
+                && wcscmp(g_wifiMap[i].serial, serial) == 0) {
+            if (wcscmp(g_wifiMap[i].ip, ip) == 0) {
+                return;
+            }
+            wcsncpy(g_wifiMap[i].ip, ip, 23);
+            g_wifiMap[i].ip[23] = L'\0';
+            break;
+        }
+        if (!g_wifiMap[i].serial[0]) {
+            wcsncpy(g_wifiMap[i].serial, serial, 63);
+            g_wifiMap[i].serial[63] = L'\0';
+            wcsncpy(g_wifiMap[i].ip, ip, 23);
+            g_wifiMap[i].ip[23] = L'\0';
+            break;
+        }
+    }
+    wchar_t ini[MAX_PATH];
+    char ini_a[MAX_PATH];
+    char s_a[64], i_a[24];
+    swprintf(ini, MAX_PATH, L"%s\\scrdock.ini", g.exeDir);
+    WideCharToMultiByte(CP_ACP, 0, ini, -1, ini_a, MAX_PATH, NULL, NULL);
+    WideCharToMultiByte(CP_ACP, 0, serial, -1, s_a, sizeof(s_a), NULL, NULL);
+    WideCharToMultiByte(CP_ACP, 0, ip, -1, i_a, sizeof(i_a), NULL, NULL);
+    WritePrivateProfileStringA("devices", s_a, i_a, ini_a);
+}
+
+static const wchar_t *wifi_ip_of(const wchar_t *serial)
+{
+    int i;
+    for (i = 0; i < DEV_MAX; i++) {
+        if (g_wifiMap[i].serial[0]
+                && wcscmp(g_wifiMap[i].serial, serial) == 0) {
+            return g_wifiMap[i].ip;
+        }
+    }
+    return NULL;
+}
+
+/* the "ip:port" serial under which this USB device is reachable now */
+static const wchar_t *wifi_serial_in_list(const wchar_t *usb_serial)
+{
+    const wchar_t *ip = wifi_ip_of(usb_serial);
+    int i;
+    if (!ip || !g.devList) {
+        return NULL;
+    }
+    for (i = 0; i < g.devList->count; i++) {
+        struct DevInfo *d = &g.devList->v[i];
+        if (wcschr(d->serial, L':') && wcsstr(d->serial, ip)
+                && wcscmp(d->state, L"device") == 0) {
+            return d->serial;
+        }
+    }
+    return NULL;
+}
+
 static unsigned __stdcall meta_thread(void *arg)
 {
     struct MetaWork *w = (struct MetaWork *) arg;
@@ -1195,6 +1339,9 @@ static unsigned __stdcall meta_thread(void *arg)
             meta_getprop(dm->serial, "ro.build.version.release",
                          dm->android, 16);
             dm->battery = meta_battery(dm->serial);
+            if (!wcschr(dm->serial, L':')) {
+                meta_ip(dm->serial, dm->ip, 20);
+            }
             mb->count++;
         }
         if (w->sel[0]) {
@@ -1256,7 +1403,8 @@ static void meta_spawn(void)
     }
 }
 
-/* ---- path/version detection (路径页"检测") ---- */
+/* ------------------------------------------------------------------ */
+/* path/version detection ---- */
 
 static unsigned __stdcall detect_thread(void *arg)
 {
@@ -1822,13 +1970,15 @@ static void hooks_remove(void)
 enum { MPAGE_DEV, MPAGE_OPT, MPAGE_PATH, MPAGE_COUNT };
 
 enum {
-    MID_LV = 1, MID_REFRESH, MID_CONNECT, MID_REMEMBER,
+    MID_LV = 1, MID_REFRESH, MID_CONNECT, MID_REMEMBER, MID_DISCONNECT,
+    MID_CHK_WIRELESS, MID_WIFI_ED, MID_WIFI_GO, MID_PAIR,
     MID_BITRATE, MID_MAXSIZE, MID_MAXFPS,
     MID_CHK_SCREENOFF, MID_CHK_STAYAWAKE, MID_CHK_NOAUDIO, MID_CHK_TOUCH,
     MID_CHK_RECONN, MID_RECONN_N, MID_CHK_CLOSEEXIT, MID_EXTRA,
     MID_OPT_SAVE,
     MID_SCRCPY_ED, MID_SCRCPY_BR, MID_ADB_ED, MID_ADB_BR,
-    MID_DETECT, MID_PATH_SAVE
+    MID_DETECT, MID_PATH_SAVE,
+    MID_PAIR_ADDR, MID_PAIR_CODE, MID_PAIR_GO
 };
 
 static struct {
@@ -1838,7 +1988,8 @@ static struct {
     RECT hdrRc;                 /* self-drawn title bar                   */
     RECT closeRc;               /* self-drawn close cell in the header    */
     HWND page[MPAGE_COUNT];
-    HWND lv, refresh, connect, remember, status, errview;
+    HWND lv, refresh, connect, remember, disconnect, status, errview;
+    HWND chkWireless, wifiEd, wifiGo, pairBtn;
     HWND bitrate, maxsize, maxfps, chkScreenOff, chkStayAwake, chkNoAudio,
          chkTouch, chkReconn, reconnN, chkCloseExit, extra, optSave;
     HWND scrcpyEd, scrcpyBr, adbEd, adbBr, detect, pathSave, detectOut;
@@ -2013,6 +2164,14 @@ static LRESULT CALLBACK mgr_page_proc(HWND hwnd, UINT msg, WPARAM wp,
             return TRUE;
         }
         break;
+    case WM_COMMAND:
+    case WM_NOTIFY:
+        /* buttons/edits/listview are children of the PAGE; their
+         * notifications arrive here and must reach the frame's handler */
+        if (m.frame) {
+            SendMessageW(m.frame, msg, wp, lp);
+        }
+        return 0;
     default:
         break;
     }
@@ -2328,11 +2487,10 @@ static void mgr_add_lv_columns(HWND lv)
 
 static void mgr_create_dev_page(HWND page, UINT dpi)
 {
-    wchar_t t[32];
     m.lv = mkctl(page, WC_LISTVIEWW,
                  LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS
                  | LVS_NOSORTHEADER | WS_TABSTOP | WS_BORDER,
-                 NULL, 0, 0, 560, 236, MID_LV, dpi);
+                 NULL, 0, 0, 560, 220, MID_LV, dpi);
     ListView_SetExtendedListViewStyle(m.lv,
         LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
     ListView_SetBkColor(m.lv, RGB(32, 32, 32));
@@ -2340,23 +2498,35 @@ static void mgr_create_dev_page(HWND page, UINT dpi)
     ListView_SetTextColor(m.lv, RGB(235, 235, 235));
     mgr_add_lv_columns(m.lv);
 
-    m.refresh = mgr_button(page, dpi, L"刷新", 0, 250, 90, MID_REFRESH);
-    m.connect = mgr_button(page, dpi, L"连接所选", 102, 250, 120,
+    m.refresh = mgr_button(page, dpi, L"刷新", 0, 232, 90, MID_REFRESH);
+    m.connect = mgr_button(page, dpi, L"连接所选", 102, 232, 120,
                            MID_CONNECT);
+    m.disconnect = mgr_button(page, dpi, L"断开", 234, 232, 90,
+                              MID_DISCONNECT);
     /* same height as the buttons so the row has one baseline */
     m.remember = mkctl(page, L"BUTTON", BS_AUTOCHECKBOX | WS_TABSTOP,
-                       L"记住此设备 (serial=)", 244, 250, 216,
+                       L"记住此设备 (serial=)", 336, 232, 216,
                        MG_BTN_H_96, MID_REMEMBER, dpi);
     SendMessageW(m.remember, BM_SETCHECK,
                  g.cfg.serial[0] ? BST_CHECKED : BST_UNCHECKED, 0);
 
+    /* wireless row: --tcpip toggle / manual adb connect / pairing */
+    m.chkWireless = mkctl(page, L"BUTTON", BS_AUTOCHECKBOX | WS_TABSTOP,
+                          L"无线(--tcpip)", 0, 276, 118,
+                          MG_BTN_H_96, MID_CHK_WIRELESS, dpi);
+    SendMessageW(m.chkWireless, BM_SETCHECK,
+                 g.cfg.wireless ? BST_CHECKED : BST_UNCHECKED, 0);
+    m.wifiEd = mkctl(page, L"EDIT", ES_AUTOHSCROLL | WS_TABSTOP,
+                     L"", 120, 276, 260, MG_BTN_H_96, MID_WIFI_ED, dpi);
+    m.wifiGo = mgr_button(page, dpi, L"连接", 398, 276, 80, MID_WIFI_GO);
+    m.pairBtn = mgr_button(page, dpi, L"配对…", 486, 276, 74, MID_PAIR);
+
     m.status = mkctl(page, L"STATIC", SS_NOPREFIX | SS_CENTERIMAGE, L"",
-                     0, 294, 560, 40, 0, dpi);
+                     0, 318, 560, 40, 0, dpi);
     m.errview = mkctl(page, L"EDIT",
                       ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY
                       | WS_VSCROLL | WS_TABSTOP,
-                      L"", 0, 344, 560, 72, MID_LV + 100, dpi);
-    (void) t;
+                      L"", 0, 362, 560, 56, MID_LV + 100, dpi);
 }
 
 static void mgr_create_opt_page(HWND page, UINT dpi)
@@ -2475,6 +2645,278 @@ static void mgr_show_page(int idx)
         ShowWindow(m.page[i], i == idx ? SW_SHOW : SW_HIDE);
     }
 }
+/* ---- adb connect / adb pair (worker) ---- */
+
+struct WifiWork {
+    int pair;                /* 0 = connect, 1 = pair                   */
+    wchar_t a[80];           /* address (connect: ip[:port], pair: ip:port) */
+    wchar_t b[16];           /* pairing code                            */
+};
+
+struct WifiResult {
+    int pair;
+    wchar_t text[256];
+};
+
+static unsigned __stdcall wifi_cmd_thread(void *arg)
+{
+    struct WifiWork *w = (struct WifiWork *) arg;
+    struct WifiResult *r = calloc(1, sizeof(*r));
+    wchar_t cmd[MAX_PATH + 200];
+    char out[512];
+    DWORD ec = 1;
+
+    if (r) {
+        r->pair = w->pair;
+        if (w->pair) {
+            swprintf(cmd, MAX_PATH + 200, L"\"%s\" pair %s %s",
+                     g.adbPath, w->a, w->b);
+        } else {
+            swprintf(cmd, MAX_PATH + 200, L"\"%s\" connect %s",
+                     g.adbPath, w->a);
+        }
+        if (capture_sync(cmd, out, sizeof(out), 20000, &ec)) {
+            char *nl = strchr(out, '\n');
+            if (nl) {
+                *nl = '\0';
+            }
+            char *e = out + strlen(out);
+            while (e > out && (e[-1] == '\r' || e[-1] == ' ')) {
+                *--e = '\0';
+            }
+            if (out[0]) {
+                MultiByteToWideChar(CP_UTF8, 0, out, -1, r->text, 255);
+            }
+        }
+        if (!r->text[0]) {
+            wcscpy(r->text, w->pair ? L"配对指令已执行（无输出）"
+                                    : L"连接指令已执行（无输出）");
+        }
+    }
+    free(w);
+    if (g.hwnd) {
+        PostMessageW(g.hwnd, WM_APP_WIFIDONE, (WPARAM) r, 0);
+    } else {
+        free(r);
+    }
+    return 0;
+}
+
+static void wifi_spawn_cmd(int pair, const wchar_t *a, const wchar_t *b)
+{
+    struct WifiWork *w = calloc(1, sizeof(*w));
+    if (!w) {
+        return;
+    }
+    w->pair = pair;
+    wcsncpy(w->a, a, 79);
+    if (b) {
+        wcsncpy(w->b, b, 15);
+    }
+    uintptr_t th = _beginthreadex(NULL, 0, wifi_cmd_thread, w, 0, NULL);
+    if (th) {
+        CloseHandle((HANDLE) th);
+    } else {
+        free(w);
+    }
+}
+
+/* ---- wireless pairing mini-dialog (Android 11+) ---- */
+
+static struct {
+    HWND frame;
+    HWND edAddr, edCode, go, out;
+    RECT hdrRc, closeRc;
+} p;
+
+static void pair_paint(HWND hwnd, HDC dc)
+{
+    RECT rc;
+    UINT dpi = wnd_dpi(hwnd);
+    GetClientRect(hwnd, &rc);
+    /* header */
+    RECT hdr = { 0, 0, rc.right, MulDiv(42, dpi, 96) };
+    p.hdrRc = hdr;
+    p.closeRc.left = rc.right - MulDiv(46, dpi, 96);
+    p.closeRc.top = MulDiv(7, dpi, 96);
+    p.closeRc.right = rc.right - MulDiv(10, dpi, 96);
+    p.closeRc.bottom = MulDiv(37, dpi, 96);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(235, 235, 235));
+    HGDIOBJ old_f = SelectObject(dc, m.fontB ? m.fontB : g.fUi);
+    RECT tr = hdr;
+    tr.left += MulDiv(16, dpi, 96);
+    DrawTextW(dc, L"无线配对（Android 11+）", -1, &tr,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    HBRUSH br = CreateSolidBrush(RGB(43, 43, 43));
+    HPEN pen = CreatePen(PS_SOLID, 1, RGB(70, 70, 70));
+    HGDIOBJ op = SelectObject(dc, pen);
+    HGDIOBJ ob = SelectObject(dc, br);
+    RoundRect(dc, p.closeRc.left, p.closeRc.top,
+              p.closeRc.right, p.closeRc.bottom, 6, 6);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(pen);
+    DeleteObject(br);
+    if (g.glyphsOk) {
+        SelectObject(dc, g.fGlyph);
+        DrawTextW(dc, L"\uE8BB", -1, &p.closeRc,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    } else {
+        DrawTextW(dc, L"X", -1, &p.closeRc,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+    SelectObject(dc, old_f);
+}
+
+static LRESULT CALLBACK pair_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_ERASEBKGND:
+        {
+            HDC dc = (HDC) wp;
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            HBRUSH br = CreateSolidBrush(RGB(32, 32, 32));
+            FillRect(dc, &rc, br);
+            DeleteObject(br);
+        }
+        return 1;
+    case WM_PAINT:
+        {
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(hwnd, &ps);
+            pair_paint(hwnd, dc);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+    case WM_NCHITTEST:
+        {
+            POINT pt;
+            pt.x = GET_X_LPARAM(lp);
+            pt.y = GET_Y_LPARAM(lp);
+            ScreenToClient(hwnd, &pt);
+            if (PtInRect(&p.closeRc, pt)) {
+                return HTCLIENT;
+            }
+            if (PtInRect(&p.hdrRc, pt)) {
+                return HTCAPTION;
+            }
+        }
+        break;
+    case WM_LBUTTONDOWN:
+        {
+            POINT pt;
+            pt.x = GET_X_LPARAM(lp);
+            pt.y = GET_Y_LPARAM(lp);
+            if (PtInRect(&p.closeRc, pt)) {
+                DestroyWindow(hwnd);
+                return 0;
+            }
+        }
+        return 0;
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+        {
+            HDC dc = (HDC) wp;
+            bool is_edit = (msg == WM_CTLCOLOREDIT)
+                || (GetWindowLongPtrW((HWND) lp, GWL_STYLE) & ES_READONLY);
+            SetBkColor(dc, is_edit ? RGB(43, 43, 43) : RGB(32, 32, 32));
+            SetTextColor(dc, RGB(230, 230, 230));
+            return (LRESULT) (is_edit ? m.brEdit : m.brBg);
+        }
+    case WM_CTLCOLORBTN:
+        return (LRESULT) (m.brBg ? m.brBg : GetStockBrush(BLACK_BRUSH));
+    case WM_DRAWITEM:
+        if (wp) {
+            draw_dark_button((DRAWITEMSTRUCT *) lp);
+            return TRUE;
+        }
+        break;
+    case WM_COMMAND:
+        if (LOWORD(wp) == MID_PAIR_GO) {
+            wchar_t a[80], c[16];
+            GetWindowTextW(p.edAddr, a, 80);
+            GetWindowTextW(p.edCode, c, 16);
+            /* trim spaces */
+            wchar_t *e = a + wcslen(a);
+            while (e > a && e[-1] == L' ') {
+                *--e = L'\0';
+            }
+            e = c + wcslen(c);
+            while (e > c && e[-1] == L' ') {
+                *--e = L'\0';
+            }
+            if (!a[0] || !c[0]) {
+                SetWindowTextW(p.out,
+                               L"请输入 手机\"无线调试\"页面显示的 ip:端口 和配对码");
+                return 0;
+            }
+            SetWindowTextW(p.out, L"配对中…");
+            wifi_spawn_cmd(1, a, c);
+        }
+        return 0;
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY:
+        ZeroMemory(&p, sizeof(p));
+        return 0;
+    default:
+        break;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void pair_open(HWND owner)
+{
+    if (p.frame && IsWindow(p.frame)) {
+        SetForegroundWindow(p.frame);
+        return;
+    }
+    UINT dpi = wnd_dpi(owner);
+    WNDCLASSW wc;
+    ZeroMemory(&wc, sizeof(wc));
+    wc.lpfnWndProc = pair_proc;
+    wc.hInstance = g_hInst;
+    wc.lpszClassName = L"scrdock_pair_cls";
+    wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    RegisterClassW(&wc);
+
+    int w96 = 420, h96 = 300;
+    RECT or_;
+    GetWindowRect(owner, &or_);
+    int mx = or_.left + 40;
+    int my = or_.top + 80;
+    p.frame = CreateWindowExW(0, L"scrdock_pair_cls", L"scrdock 配对",
+                              WS_POPUP,
+                              mx, my,
+                              MulDiv(w96, dpi, 96), MulDiv(h96, dpi, 96),
+                              owner, NULL, g_hInst, NULL);
+    if (!p.frame) {
+        return;
+    }
+    mgr_dark_titlebar(p.frame);
+
+    HWND f = p.frame;
+    mkctl(f, L"STATIC", SS_NOPREFIX | SS_CENTERIMAGE,
+          L"配对地址 (ip:端口)", 16, 56, 130, MG_ROW_H_96, 0, dpi);
+    p.edAddr = mkctl(f, L"EDIT", ES_AUTOHSCROLL | WS_TABSTOP,
+                     L"", 152, 56, 240, MG_ROW_H_96, MID_PAIR_ADDR, dpi);
+    mkctl(f, L"STATIC", SS_NOPREFIX | SS_CENTERIMAGE,
+          L"配对码", 16, 100, 130, MG_ROW_H_96, 0, dpi);
+    p.edCode = mkctl(f, L"EDIT", ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP,
+                     L"", 152, 100, 100, MG_ROW_H_96, MID_PAIR_CODE, dpi);
+    p.go = mkctl(f, L"BUTTON", WS_TABSTOP, L"开始配对",
+                 152, 148, 110, MG_BTN_H_96, MID_PAIR_GO, dpi);
+    p.out = mkctl(f, L"STATIC", SS_NOPREFIX | SS_CENTERIMAGE, L"",
+                  16, 196, 388, 56, 0, dpi);
+    mkctl(f, L"STATIC", SS_NOPREFIX | SS_CENTERIMAGE,
+          L"手机: 设置 → 开发者选项 → 无线调试 → 用配对码配对设备",
+          16, 262, 388, MG_ROW_H_96, 0, dpi);
+    ShowWindow(p.frame, SW_SHOW);
+}
+
 
 /* self-drawn tab strip, below the frameless header */
 static void mgr_strip_layout(void)
@@ -2644,6 +3086,49 @@ static LRESULT CALLBACK mgr_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             break;
         case MID_CONNECT:
             mgr_connect_selected();
+            break;
+        case MID_DISCONNECT:
+            if (g.hProc) {
+                g.reconnPending = false;
+                KillTimer(NULL, TIMER_RECONN);
+                close_scrcpy_and_wait();
+            }
+            wcscpy(g.tipStatus, L"已断开会话");
+            mgr_refresh();
+            InvalidateRect(g.hwnd, NULL, FALSE);
+            break;
+        case MID_CHK_WIRELESS:
+            g.cfg.wireless = ISCHK(m.chkWireless);
+            ini_save();
+            wcscpy(g.tipStatus, g.cfg.wireless
+                   ? L"无线已开启：下次连接经 USB 切到 WiFi (--tcpip)"
+                   : L"无线已关闭");
+            break;
+        case MID_WIFI_GO:
+            {
+                wchar_t a[80];
+                GetWindowTextW(m.wifiEd, a, 80);
+                wchar_t *e = a + wcslen(a);
+                while (e > a && e[-1] == L' ') {
+                    *--e = L'\0';
+                }
+                if (a[0]) {
+                    wchar_t addr[84];
+                    if (!wcschr(a, L':')) {
+                        swprintf(addr, 84, L"%s:5555", a);
+                    } else {
+                        wcsncpy(addr, a, 83);
+                        addr[83] = L'\0';
+                    }
+                    SetWindowTextW(m.status, L"连接中…");
+                    wifi_spawn_cmd(0, addr, NULL);
+                }
+            }
+            break;
+        case MID_PAIR:
+            if (m.frame) {
+                pair_open(m.frame);
+            }
             break;
         case MID_OPT_SAVE:
             mgr_opt_save();
@@ -3285,7 +3770,26 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 break;
             }
             if (!dev_online(g.serial)) {
-                break; /* still gone; WM_APP_DEVLIST re-arms when it's back */
+                /* keep trying to bring a WiFi device back (cheap, idempotent);
+                 * DEVLIST re-arms immediately once it appears */
+                if (wcschr(g.serial, L':')) {
+                    adb_spawn(L" connect %s", g.serial);
+                } else {
+                    const wchar_t *wf = wifi_serial_in_list(g.serial);
+                    if (wf) {
+                        wcsncpy(g.serial, wf, 127);
+                        g.serial[127] = L'\0';
+                    } else {
+                        const wchar_t *ip = wifi_ip_of(g.serial);
+                        if (ip) {
+                            adb_spawn(L" connect %s:5555", ip);
+                        }
+                    }
+                }
+                if (g.reconnAttempts < g.cfg.reconnect_attempts) {
+                    reconn_arm(); /* retry loop until budget is spent */
+                }
+                break;
             }
             if (g.reconnAttempts >= g.cfg.reconnect_attempts) {
                 g.reconnPending = false;
@@ -3322,6 +3826,12 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     g.scrW = mb->scrW;
                     g.scrH = mb->scrH;
                 }
+                int i;
+                for (i = 0; i < mb->count; i++) {
+                    if (mb->v[i].ip[0]) {
+                        wifi_map_set(mb->v[i].serial, mb->v[i].ip);
+                    }
+                }
                 g.devMeta = *mb;
                 free(mb);
             }
@@ -3342,6 +3852,22 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     SetWindowTextW(m.detectOut, txt);
                 }
                 free(txt);
+            }
+        }
+        return 0;
+
+    case WM_APP_WIFIDONE:
+        {
+            struct WifiResult *r = (struct WifiResult *) wp;
+            if (r) {
+                if (r->pair && p.out && IsWindow(p.out)) {
+                    SetWindowTextW(p.out, r->text);
+                } else if (m.status && IsWindow(m.status)) {
+                    SetWindowTextW(m.status, r->text);
+                }
+                wcsncpy(g.tipStatus, r->text, MAX_PATH + 31);
+                g.tipStatus[MAX_PATH + 31] = L'\0';
+                free(r);
             }
         }
         return 0;
@@ -3370,6 +3896,28 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     g.reconnAttempts = 0; /* stable session: fresh budget */
                 }
                 g.reconnPending = true;
+                /* wireless: after a --tcpip switch or a dropped WiFi link
+                 * the device lives under an "ip:port" serial instead */
+                if (!dev_online(g.serial)) {
+                    const wchar_t *wf = wifi_serial_in_list(g.serial);
+                    if (wf) {
+                        wcsncpy(g.serial, wf, 127);
+                        g.serial[127] = L'\0';
+                    } else {
+                        const wchar_t *base = wcschr(g.serial, L':')
+                            ? g.serial : wifi_ip_of(g.serial);
+                        if (base) {
+                            wchar_t addr[80];
+                            if (wcschr(base, L':')) {
+                                wcsncpy(addr, base, 79);
+                                addr[79] = L'\0';
+                            } else {
+                                swprintf(addr, 80, L"%s:5555", base);
+                            }
+                            adb_spawn(L" connect %s", addr);
+                        }
+                    }
+                }
                 swprintf(g.tipStatus, MAX_PATH + 32, L"设备断开，重连中 (%d/%d)",
                          g.reconnAttempts + 1, g.cfg.reconnect_attempts);
                 if (dev_online(g.serial)) {
@@ -3502,6 +4050,7 @@ int WINAPI wWinMain(HINSTANCE h_inst, HINSTANCE h_prev, PWSTR cmd_line,
 
     get_exe_dir(g.exeDir);
     ini_load();
+    wifi_map_load();
 
     SECURITY_ATTRIBUTES sa;
     sa.nLength = sizeof(sa);
