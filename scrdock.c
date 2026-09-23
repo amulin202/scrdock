@@ -2825,18 +2825,95 @@ static void mgr_show_page(int idx)
         ShowWindow(m.page[i], i == idx ? SW_SHOW : SW_HIDE);
     }
 }
-/* ---- adb connect / adb pair (worker) ---- */
+/* ---- adb connect / adb pair / mdns discovery (worker) ---- */
 
 struct WifiWork {
-    int pair;                /* 0 = connect, 1 = pair                   */
+    int mode;                /* 0 = connect, 1 = pair, 2 = discover only  */
     wchar_t a[80];           /* address (connect: ip[:port], pair: ip:port) */
     wchar_t b[16];           /* pairing code                            */
 };
 
 struct WifiResult {
-    int pair;
+    int pair;                /* 1 = report into the pairing dialog      */
     wchar_t text[256];
+    wchar_t addr[80];        /* discovered address (prefills the edit)  */
 };
+
+/* Parse "adb mdns services" output: lines look like
+ *   <name> _adb-tls-connect._tcp 192.168.1.9:37123
+ * Collect the ip:port tail of every connect service. */
+static int mdns_parse(const char *buf, wchar_t addrs[][80], int max)
+{
+    char *dup = _strdup(buf ? buf : "");
+    int n = 0;
+    if (!dup) return 0;
+    char *ctx = NULL;
+    for (char *line = strtok_s(dup, "\r\n", &ctx); line && n < max;
+            line = strtok_s(NULL, "\r\n", &ctx)) {
+        char name[256], type[80], addr[256];
+        if (sscanf(line, "%255s %79s %255s", name, type, addr) != 3
+                || (strcmp(type, "_adb-tls-connect._tcp") != 0
+                    && strcmp(type, "_adb-tls-connect._tcp.") != 0)) continue;
+        size_t len = strlen(addr);
+        char *colon = strrchr(addr, ':');
+        if (len >= 80 || !colon || colon == addr || !colon[1]) continue;
+        /* Only numeric network endpoints; never pass arbitrary output as args. */
+        if (strspn(addr, "0123456789abcdefABCDEF:.[]") != len) continue;
+        char *tail;
+        long port = strtol(colon + 1, &tail, 10);
+        if (*tail || port < 1 || port > 65535) continue;
+        wchar_t value[80];
+        if (!MultiByteToWideChar(CP_ACP, 0, addr, -1, value, 80)) continue;
+        int i;
+        for (i = 0; i < n && wcscmp(addrs[i], value); i++) {}
+        if (i == n) wcscpy(addrs[n++], value);
+    }
+    free(dup);
+    return n;
+}
+
+static void wifi_append(struct WifiResult *r, const wchar_t *text)
+{
+    wcsncat_s(r->text, 256, text, _TRUNCATE);
+}
+
+/* mDNS advertises endpoints, not pairing trust. adb connect checks trust. */
+static void mdns_discover_and_connect(struct WifiResult *r)
+{
+    wchar_t cmd[MAX_PATH + 32];
+    char buf[4096];
+    DWORD ec = 1;
+    wchar_t addrs[4][80];
+    int n = 0;
+    swprintf(cmd, MAX_PATH + 32, L"\"%s\" mdns services", g.adbPath);
+    for (int attempt = 0; attempt < 5 && n == 0; attempt++) {
+        if (!capture_sync(cmd, buf, sizeof(buf), 8000, &ec) || ec != 0) {
+            wifi_append(r, L"\r\nmDNS 查询失败或超时，请手动填地址连接");
+            return;
+        }
+        n = mdns_parse(buf, addrs, 4);
+        if (n == 0 && attempt < 4) Sleep(2000);
+    }
+    if (n == 0) {
+        wifi_append(r, L"\r\n未发现设备，请确认无线调试已开启，或手动填地址连接");
+        return;
+    }
+    wcscpy(r->addr, addrs[0]);
+    if (n > 1) {
+        wifi_append(r, L"\r\n发现多个无线端点，未自动连接；已填入第一项，请核对手机连接地址后点连接");
+        return;
+    }
+    wchar_t ccmd[MAX_PATH + 200];
+    char output[512];
+    swprintf(ccmd, MAX_PATH + 200, L"\"%s\" connect %s", g.adbPath, addrs[0]);
+    int captured = capture_sync(ccmd, output, sizeof(output), 15000, &ec);
+    /* Some adb versions report connection failures with exit status zero. */
+    int connected = captured && ec == 0
+        && (strncmp(output, "connected to ", 13) == 0
+            || strncmp(output, "already connected to ", 21) == 0);
+    wifi_append(r, connected ? L"\r\n已连接 " : L"\r\n自动连接失败，请核对配对状态及地址：");
+    wifi_append(r, addrs[0]);
+}
 
 static unsigned __stdcall wifi_cmd_thread(void *arg)
 {
@@ -2847,15 +2924,18 @@ static unsigned __stdcall wifi_cmd_thread(void *arg)
     DWORD ec = 1;
 
     if (r) {
-        r->pair = w->pair;
-        if (w->pair) {
+        r->pair = (w->mode == 1);
+        if (w->mode == 1) {
             swprintf(cmd, MAX_PATH + 200, L"\"%s\" pair %s %s",
                      g.adbPath, w->a, w->b);
+        } else if (w->mode == 2) {
+            cmd[0] = L'\0';
         } else {
             swprintf(cmd, MAX_PATH + 200, L"\"%s\" connect %s",
                      g.adbPath, w->a);
         }
-        if (capture_sync(cmd, out, sizeof(out), 20000, &ec)) {
+        if (cmd[0]
+                && capture_sync(cmd, out, sizeof(out), 20000, &ec)) {
             char *nl = strchr(out, '\n');
             if (nl) {
                 *nl = '\0';
@@ -2868,9 +2948,14 @@ static unsigned __stdcall wifi_cmd_thread(void *arg)
                 MultiByteToWideChar(CP_UTF8, 0, out, -1, r->text, 255);
             }
         }
-        if (!r->text[0]) {
-            wcscpy(r->text, w->pair ? L"配对指令已执行（无输出）"
-                                    : L"连接指令已执行（无输出）");
+        if (!r->text[0] && w->mode != 2) {
+            wcscpy(r->text, w->mode == 1 ? L"配对指令已执行（无输出）"
+                                         : L"连接指令已执行（无输出）");
+        }
+        /* successful pairing (or an empty address box) → auto-discover:
+         * mDNS yields the current connect port, separate from pairing */
+        if (w->mode == 2 || (w->mode == 1 && ec == 0)) {
+            mdns_discover_and_connect(r);
         }
     }
     free(w);
@@ -2882,14 +2967,16 @@ static unsigned __stdcall wifi_cmd_thread(void *arg)
     return 0;
 }
 
-static void wifi_spawn_cmd(int pair, const wchar_t *a, const wchar_t *b)
+static void wifi_spawn_cmd(int mode, const wchar_t *a, const wchar_t *b)
 {
     struct WifiWork *w = calloc(1, sizeof(*w));
     if (!w) {
         return;
     }
-    w->pair = pair;
-    wcsncpy(w->a, a, 79);
+    w->mode = mode;
+    if (a) {
+        wcsncpy(w->a, a, 79);
+    }
     if (b) {
         wcsncpy(w->b, b, 15);
     }
@@ -3332,6 +3419,10 @@ static LRESULT CALLBACK mgr_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     }
                     SetWindowTextW(m.status, L"连接中…");
                     wifi_spawn_cmd(0, addr, NULL);
+                } else {
+                    /* empty box: discover paired devices over mDNS */
+                    SetWindowTextW(m.status, L"正在发现无线设备…");
+                    wifi_spawn_cmd(2, NULL, NULL);
                 }
             }
             break;
@@ -4128,6 +4219,9 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         {
             struct WifiResult *r = (struct WifiResult *) wp;
             if (r) {
+                if (r->addr[0] && m.wifiEd && IsWindow(m.wifiEd)) {
+                    SetWindowTextW(m.wifiEd, r->addr);
+                }
                 if (r->pair && p.out && IsWindow(p.out)) {
                     SetWindowTextW(p.out, r->text);
                 } else if (m.status && IsWindow(m.status)) {
