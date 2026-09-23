@@ -60,6 +60,7 @@
 #define WM_APP_PROCEXIT (WM_APP + 4)  /* wp: exit code, lp: proc gen   */
 #define WM_APP_DETECTED (WM_APP + 5)  /* wp: heap wchar[] text         */
 #define WM_APP_WIFIDONE (WM_APP + 6)  /* wp: heap WifiResult*          */
+#define WM_APP_SESEXIT  (WM_APP + 7)  /* wp: session index             */
 
 #define TIMER_HUNT  1  /* 200 ms: poll for the scrcpy window            */
 #define TIMER_SYNC  2  /* 500 ms: safety net (missed events, pid polls) */
@@ -215,6 +216,84 @@ struct Scrdock {
 static struct Scrdock g;
 static HINSTANCE g_hInst;
 
+/* ---- multi-session model ------------------------------------------------
+ *
+ * Up to SES_MAX scrcpy sessions run side by side, one per device. The
+ * ACTIVE session's handles live in g.* (pid/hProc/hErr/target/gen/...), so
+ * every existing code path (toolbar, shortcuts, dock, reconnect) keeps
+ * operating on exactly one session with no changes. Background sessions
+ * keep their handles in their slot; promoting a slot swaps the fields
+ * between g.* and the previous active slot (ses_become_active). */
+
+#define SES_MAX 4
+
+struct Session {
+    bool used;
+    wchar_t serial[64];
+    DWORD pid;
+    HANDLE hProc;            /* NULL while this slot IS the active one */
+    HANDLE hErr;
+    HWND target;
+    unsigned gen;
+    ULONGLONG launchTick;
+    int reconnAttempts;
+    bool reconnPending;
+};
+
+static struct Session g_ses[SES_MAX];
+static int g_active = -1;   /* slot whose handles currently live in g.* */
+static unsigned g_genSeq;   /* unique generation counter across sessions */
+
+static int ses_find(const wchar_t *serial)
+{
+    int i;
+    for (i = 0; i < SES_MAX; i++) {
+        if (g_ses[i].used && wcscmp(g_ses[i].serial, serial) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int ses_free_slot(void)
+{
+    int i;
+    for (i = 0; i < SES_MAX; i++) {
+        if (!g_ses[i].used) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void ses_free(int idx)
+{
+    if (idx < 0 || idx >= SES_MAX || !g_ses[idx].used) {
+        return;
+    }
+    if (g_ses[idx].hErr) {
+        CloseHandle(g_ses[idx].hErr);
+    }
+    if (g_ses[idx].hProc) {
+        CloseHandle(g_ses[idx].hProc);
+    }
+    ZeroMemory(&g_ses[idx], sizeof(g_ses[idx]));
+    if (g_active == idx) {
+        g_active = -1;
+    }
+}
+
+static int ses_first_used(void)
+{
+    int i;
+    for (i = 0; i < SES_MAX; i++) {
+        if (g_ses[i].used) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 /* forward declarations for cross-section calls (single translation unit) */
 static void hooks_install(DWORD pid);
 static void hooks_remove(void);
@@ -224,6 +303,9 @@ static void mgr_open(void);
 static void mgr_refresh(void);
 static void mgr_toggle(void);
 static void meta_spawn(void);
+static bool dev_online(const wchar_t *serial);
+static void reconn_arm(void);
+static void ses_become_active(int idx);
 
 /* ------------------------------------------------------------------ */
 /* small utilities                                                     */
@@ -525,13 +607,13 @@ static void cmd_catf(wchar_t *out, size_t cch, int *n, const wchar_t *fmt, ...)
  * silently drift to another device, then the structured options, then the
  * raw scrcpy_args tail (scrcpy applies options in order, so the tail wins
  * and can override anything above). */
-static void build_scrcpy_cmd(wchar_t *cmd, size_t cch)
+static void build_scrcpy_cmd(wchar_t *cmd, size_t cch, const wchar_t *serial)
 {
     int n = 0;
     cmd[0] = L'\0';
     cmd_catf(cmd, cch, &n, L"\"%s\"", g.scrcpyPath);
-    if (g.serial[0]) {
-        cmd_catf(cmd, cch, &n, L" -s %s", g.serial);
+    if (serial[0]) {
+        cmd_catf(cmd, cch, &n, L" -s %s", serial);
     }
     /* Pin MOD=Left-Alt so the toolbar can send instant MOD+key shortcuts to
      * the scrcpy window (see send_scrcpy_shortcut). Skipped if the user
@@ -561,7 +643,7 @@ static void build_scrcpy_cmd(wchar_t *cmd, size_t cch)
     if (g.cfg.show_touches) {
         cmd_catf(cmd, cch, &n, L" --show-touches");
     }
-    if (g.cfg.wireless && (!g.serial[0] || !wcschr(g.serial, L':'))) {
+    if (g.cfg.wireless && (!serial[0] || !wcschr(serial, L':'))) {
         /* USB -> WiFi switch; on an ip:port serial it would be redundant */
         cmd_catf(cmd, cch, &n, L" --tcpip");
     }
@@ -570,25 +652,69 @@ static void build_scrcpy_cmd(wchar_t *cmd, size_t cch)
     }
 }
 
-static bool launch_scrcpy(void)
+/* Launch a new scrcpy session for `serial`.
+ * activate=true: the session becomes the toolbar-controlled one (fields in
+ * g.*, hooks installed, hunting started). activate=false: it runs in the
+ * background slot for that serial. */
+static bool launch_scrcpy_ex(const wchar_t *serial, bool activate)
 {
     wchar_t cmd[1400];
     wchar_t dir[MAX_PATH];
+    struct Session *slot = NULL;
+    int idx;
 
-    /* retire any previous child: stale PROCEXIT messages are gen-tagged */
-    KillTimer(g.hwnd, TIMER_RECONN);
-    g.reconnPending = false;
-    if (g.hErr) {
-        err_drain(true);
+    /* slot bookkeeping: one session per serial (resolved before touching
+     * the active state below) */
+    idx = ses_find(serial);
+    if (idx < 0) {
+        idx = ses_free_slot();
+        if (idx < 0) {
+            return false; /* session table full */
+        }
+        ZeroMemory(&g_ses[idx], sizeof(g_ses[idx]));
+        g_ses[idx].used = true;
+        wcsncpy(g_ses[idx].serial, serial, 63);
     }
-    if (g.hProc) {
-        CloseHandle(g.hProc);
-        g.hProc = NULL;
+    slot = &g_ses[idx];
+    if (slot->hErr) {
+        CloseHandle(slot->hErr);
+        slot->hErr = NULL;
     }
-    g.errBuf[0] = '\0';
-    g.errLine[0] = L'\0';
+    if (slot->hProc) {
+        CloseHandle(slot->hProc);
+        slot->hProc = NULL;
+    }
 
-    build_scrcpy_cmd(cmd, 1400);
+    if (activate) {
+        KillTimer(g.hwnd, TIMER_RECONN);
+        g.reconnPending = false;
+        if (g.hErr) {
+            err_drain(true);
+        }
+        if (g_active >= 0 && g_active != idx) {
+            /* the running active session moves to the background and keeps
+             * running; its handles go back to its slot (waited by run_loop) */
+            struct Session *cur = &g_ses[g_active];
+            cur->hProc = g.hProc;
+            cur->hErr = g.hErr;
+            cur->target = g.target;
+            cur->pid = g.pid;
+            cur->gen = g.procGen;
+            cur->launchTick = g.launchTick;
+            cur->reconnAttempts = g.reconnAttempts;
+            cur->reconnPending = false; /* paused while in the background */
+            wcsncpy(cur->serial, g.serial, 63);
+            cur->serial[63] = L'\0';
+        } else if (g.hProc) {
+            /* same session relaunched: retire its previous child */
+            CloseHandle(g.hProc);
+            g.hProc = NULL;
+        }
+        g.errBuf[0] = '\0';
+        g.errLine[0] = L'\0';
+    }
+
+    build_scrcpy_cmd(cmd, 1400, serial);
     dir_of(g.scrcpyPath, dir, MAX_PATH);
 
     /* stderr -> pipe: launch failures become visible instead of vanishing
@@ -627,25 +753,49 @@ static bool launch_scrcpy(void)
         if (wr) {
             CloseHandle(wr);
         }
+        if (!g_ses[idx].pid) {
+            ses_free(idx); /* nothing ever ran on this fresh slot */
+        }
         return false;
     }
     CloseHandle(pi.hThread);
     if (wr) {
         CloseHandle(wr); /* the child holds the only write end now */
     }
-    g.hErr = rd;
-    g.hProc = pi.hProcess;
-    g.pid = pi.dwProcessId;
-    g.launched = true;
-    g.launchTick = GetTickCount64();
-    g.procGen++;
+    slot->pid = pi.dwProcessId;
+    slot->launchTick = GetTickCount64();
+    slot->gen = ++g_genSeq;
+    slot->reconnAttempts = 0;
+    slot->reconnPending = false;
 
-    /* a brand new process: re-target the window hooks and hunt for the SDL
-     * window (the toolbar re-docks when it appears) */
-    g.target = NULL;
-    hooks_install(g.pid);
-    hunting_start();
+    if (activate) {
+        g.hErr = rd;
+        g.hProc = pi.hProcess;
+        g.pid = slot->pid;
+        g.launched = true;
+        g.launchTick = slot->launchTick;
+        g.procGen = slot->gen;
+        g.reconnAttempts = 0;
+        g.reconnPending = false;
+        wcsncpy(g.serial, serial, 127);
+        g.serial[127] = L'\0';
+        g_active = idx;
+
+        /* a brand new process: re-target the window hooks and hunt for the
+         * SDL window (the toolbar re-docks when it appears) */
+        g.target = NULL;
+        hooks_install(g.pid);
+        hunting_start();
+    } else {
+        slot->hErr = rd;
+        slot->hProc = pi.hProcess;
+    }
     return true;
+}
+
+static bool launch_scrcpy(void)
+{
+    return launch_scrcpy_ex(g.serial, true);
 }
 
 /* Close scrcpy gracefully (WM_CLOSE -> SDL3 quit-on-last-window-close),
@@ -2252,6 +2402,12 @@ static void mgr_list_reload(void)
         } else {
             ListView_SetItemText(m.lv, i, 5, (LPWSTR) L"—");
         }
+        {
+            int sx = ses_find(d->serial);
+            ListView_SetItemText(m.lv, i, 6,
+                sx < 0 ? (LPWSTR) L""
+                : (sx == g_active ? (LPWSTR) L"●当前" : (LPWSTR) L"●"));
+        }
         if (wcscmp(d->serial, g.serial) == 0) {
             selItem = i;
         }
@@ -2283,9 +2439,17 @@ static void mgr_update_status(void)
     } else {
         wcscpy(run, L"未由本工具启动");
     }
-    wchar_t txt[512];
-    swprintf(txt, 512, L"目标设备: %s   |   scrcpy: %s",
-             g.serial[0] ? g.serial : L"（未选择）", run);
+    wchar_t txt[560];
+    {
+        int i, used = 0;
+        for (i = 0; i < SES_MAX; i++) {
+            if (g_ses[i].used) {
+                used++;
+            }
+        }
+        swprintf(txt, 560, L"目标设备: %s   |   会话 %d/%d   |   scrcpy: %s",
+                 g.serial[0] ? g.serial : L"（未选择）", used, SES_MAX, run);
+    }
     SetWindowTextW(m.status, txt);
     wchar_t tail[1200];
     MultiByteToWideChar(CP_UTF8, 0, g.errBuf, -1, tail, 1199);
@@ -2304,46 +2468,61 @@ static void mgr_refresh(void)
     mgr_update_status();
 }
 
-/* 双击列表项 = 连接该设备 */
-static void mgr_connect_selected(void)
+/* selected list row's serial (true on success) */
+static bool mgr_selected_serial(wchar_t *out, size_t cch)
 {
-    if (!m.lv || !g.devList) {
-        return;
-    }
-    int it = ListView_GetNextItem(m.lv, -1, LVNI_SELECTED);
-    if (it < 0) {
-        return;
-    }
     LVITEMW vi;
+    int it, di;
+    if (!m.lv || !g.devList) {
+        return false;
+    }
+    it = ListView_GetNextItem(m.lv, -1, LVNI_SELECTED);
+    if (it < 0) {
+        return false;
+    }
     ZeroMemory(&vi, sizeof(vi));
     vi.mask = LVIF_PARAM;
     vi.iItem = it;
     if (!ListView_GetItem(m.lv, &vi)) {
-        return;
+        return false;
     }
-    int di = (int) vi.lParam;
+    di = (int) vi.lParam;
     if (di < 0 || di >= g.devList->count) {
+        return false;
+    }
+    wcsncpy(out, g.devList->v[di].serial, cch - 1);
+    out[cch - 1] = L'\0';
+    return true;
+}
+
+/* 双击列表项 = 连接该设备（已有会话则切换为活动会话） */
+static void mgr_connect_selected(void)
+{
+    wchar_t serial[64];
+    if (!mgr_selected_serial(serial, 64)) {
         return;
     }
-    struct DevInfo *d = &g.devList->v[di];
-
-    wcsncpy(g.serial, d->serial, 127);
-    g.serial[127] = L'\0';
     if (ISCHK(m.remember)) {
-        wcsncpy(g.cfg.serial, d->serial, 127);
+        wcsncpy(g.cfg.serial, serial, 127);
         g.cfg.serial[127] = L'\0';
     } else {
         g.cfg.serial[0] = L'\0';
     }
     ini_save();
-    g.procGen++; /* invalidate any queued PROCEXIT from the old child */
-    if (g.hProc) {
-        close_scrcpy_and_wait(); /* switch: always close the old session */
+
+    int idx = ses_find(serial);
+    if (idx >= 0 && idx != g_active) {
+        ses_become_active(idx); /* running: just switch the toolbar to it */
+        swprintf(g.tipStatus, MAX_PATH + 32, L"已切换到 %s", serial);
+        return;
     }
-    launch_scrcpy();
     g.reconnAttempts = 0;
-    g.reconnPending = false;
-    swprintf(g.tipStatus, MAX_PATH + 32, L"已连接 %s", d->serial);
+    g.procGen++; /* invalidate any queued PROCEXIT from the old child */
+    if (!launch_scrcpy_ex(serial, true)) {
+        wcscpy(g.tipStatus, L"启动失败：会话数已达上限（4）或 scrcpy 启动错误");
+    } else {
+        swprintf(g.tipStatus, MAX_PATH + 32, L"已连接 %s", serial);
+    }
     mgr_refresh();
 }
 
@@ -2467,15 +2646,16 @@ static void mgr_browse(HWND ctrl)
 static void mgr_add_lv_columns(HWND lv)
 {
     struct { const wchar_t *t; int w; } cols[] = {
-        { L"状态",   64 },
-        { L"序列号", 150 },
-        { L"型号",   130 },
-        { L"系统",   90 },
-        { L"连接",   64 },
-        { L"电量",   56 },
+        { L"状态",   56 },
+        { L"序列号", 140 },
+        { L"型号",   110 },
+        { L"系统",   80 },
+        { L"连接",   56 },
+        { L"电量",   48 },
+        { L"投屏",   56 },
     };
     int i;
-    for (i = 0; i < 6; i++) {
+    for (i = 0; i < 7; i++) {
         LVCOLUMNW c;
         ZeroMemory(&c, sizeof(c));
         c.mask = LVCF_TEXT | LVCF_WIDTH;
@@ -3088,14 +3268,44 @@ static LRESULT CALLBACK mgr_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             mgr_connect_selected();
             break;
         case MID_DISCONNECT:
-            if (g.hProc) {
-                g.reconnPending = false;
-                KillTimer(NULL, TIMER_RECONN);
-                close_scrcpy_and_wait();
+            {
+                wchar_t serial[64];
+                int idx = -1;
+                if (mgr_selected_serial(serial, 64)) {
+                    idx = ses_find(serial);
+                }
+                if (idx < 0 || idx == g_active) {
+                    /* active session (or none selected): graceful close,
+                     * then follow the next remaining session if any */
+                    g.reconnPending = false;
+                    KillTimer(NULL, TIMER_RECONN);
+                    close_scrcpy_and_wait();
+                    int a = g_active;
+                    g_active = -1;
+                    if (a >= 0) {
+                        g_ses[a].hProc = NULL; /* closed above */
+                        g_ses[a].hErr = NULL;  /* drained by teardown path */
+                        ses_free(a);
+                    }
+                    g.launched = false;
+                    int next = ses_first_used();
+                    if (next >= 0) {
+                        ses_become_active(next);
+                    }
+                } else {
+                    /* background session: close its window; the exit is
+                     * cleaned up by WM_APP_SESEXIT */
+                    struct Session *s = &g_ses[idx];
+                    if (s->target && IsWindow(s->target)) {
+                        PostMessageW(s->target, WM_CLOSE, 0, 0);
+                    } else if (s->hProc) {
+                        TerminateProcess(s->hProc, 1);
+                    }
+                }
+                wcscpy(g.tipStatus, L"已断开会话");
+                mgr_refresh();
+                InvalidateRect(g.hwnd, NULL, FALSE);
             }
-            wcscpy(g.tipStatus, L"已断开会话");
-            mgr_refresh();
-            InvalidateRect(g.hwnd, NULL, FALSE);
             break;
         case MID_CHK_WIRELESS:
             g.cfg.wireless = ISCHK(m.chkWireless);
@@ -3477,6 +3687,54 @@ static void reconn_arm(void)
     SetTimer(g.hwnd, TIMER_RECONN, 1500, NULL);
 }
 
+/* Promote a background session to be the toolbar-controlled one: swap the
+ * fields between g.* and the previous active slot, re-target the hooks and
+ * start hunting for this session's SDL window. */
+static void ses_become_active(int idx)
+{
+    struct Session *s;
+    if (idx < 0 || idx >= SES_MAX || !g_ses[idx].used) {
+        return;
+    }
+    /* demote the current active session back into its slot */
+    if (g_active >= 0 && g_active != idx) {
+        struct Session *cur = &g_ses[g_active];
+        cur->hProc = g.hProc;
+        cur->hErr = g.hErr;
+        cur->target = g.target;
+        cur->pid = g.pid;
+        cur->gen = g.procGen;
+        cur->launchTick = g.launchTick;
+        cur->reconnAttempts = g.reconnAttempts;
+        cur->reconnPending = g.reconnPending;
+        wcsncpy(cur->serial, g.serial, 63);
+        cur->serial[63] = L'\0';
+    }
+    s = &g_ses[idx];
+    g.hProc = s->hProc;
+    g.hErr = s->hErr;
+    g.pid = s->pid;
+    g.procGen = s->gen;
+    g.launchTick = s->launchTick;
+    g.reconnAttempts = s->reconnAttempts;
+    g.reconnPending = s->reconnPending;
+    wcsncpy(g.serial, s->serial, 127);
+    g.serial[127] = L'\0';
+    g.launched = true;
+    s->hProc = NULL;
+    s->hErr = NULL;
+    g_active = idx;
+    g.target = NULL;
+    KillTimer(g.hwnd, TIMER_RECONN);
+    hooks_install(g.pid);
+    hunting_start();
+    if (g.reconnPending && !g.hProc && dev_online(g.serial)) {
+        reconn_arm(); /* resume a pending reconnect of this session */
+    }
+    mgr_refresh();
+    InvalidateRect(g.hwnd, NULL, FALSE);
+}
+
 /* UI-thread application of a fresh device snapshot (takes ownership). */
 static void devlist_apply(struct DevList *dl)
 {
@@ -3556,6 +3814,16 @@ static void teardown(HWND hwnd)
     }
     if (g.cfg.close_on_exit) {
         close_scrcpy_and_wait();
+    }
+    {
+        /* background sessions do not survive the toolbar either */
+        int i;
+        for (i = 0; i < SES_MAX; i++) {
+            if (g_ses[i].used && g_ses[i].hProc) {
+                TerminateProcess(g_ses[i].hProc, 1);
+            }
+            ses_free(i);
+        }
     }
     PostQuitMessage(0);
 }
@@ -3928,17 +4196,62 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 return 0;
             }
             if (code == 0) {
-                DestroyWindow(hwnd); /* user closed the scrcpy window */
+                /* user closed the active scrcpy window: retire the session
+                 * and follow another one, or exit with the last one */
+                int a = g_active;
+                g_active = -1;
+                if (a >= 0) {
+                    g_ses[a].hProc = NULL; /* closed by run_loop already */
+                    g_ses[a].hErr = NULL;  /* drained above */
+                    ses_free(a);
+                }
+                g.launched = false;
+                {
+                    int next = ses_first_used();
+                    if (next >= 0) {
+                        ses_become_active(next);
+                        return 0;
+                    }
+                }
+                DestroyWindow(hwnd);
                 return 0;
             }
             /* failed (and not reconnecting): stay alive, surface the error */
             swprintf(g.tipStatus, MAX_PATH + 32, L"scrcpy 已退出 (code %lu)",
                      code);
+            {
+                int a = g_active;
+                g_active = -1;
+                if (a >= 0) {
+                    g_ses[a].hProc = NULL;
+                    g_ses[a].hErr = NULL;
+                    ses_free(a);
+                }
+                g.launched = false;
+                {
+                    int next = ses_first_used();
+                    if (next >= 0) {
+                        ses_become_active(next);
+                    }
+                }
+            }
             if (!g.everDocked) {
                 mgr_open(); /* e.g. boot failure: the manager shows why */
             }
             mgr_refresh();
             InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+
+    case WM_APP_SESEXIT:
+        {
+            int idx = (int) wp;
+            if (idx >= 0 && idx < SES_MAX && g_ses[idx].used) {
+                swprintf(g.tipStatus, MAX_PATH + 32, L"会话已结束: %s",
+                         g_ses[idx].serial);
+                ses_free(idx);
+                mgr_refresh();
+            }
         }
         return 0;
 
@@ -3970,25 +4283,48 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 static int run_loop(void)
 {
     for (;;) {
-        DWORD r = MsgWaitForMultipleObjectsEx(g.hProc ? 1 : 0, &g.hProc,
-                                              INFINITE, QS_ALLINPUT,
-                                              MWMO_INPUTAVAILABLE);
-        if (g.hProc && r == WAIT_OBJECT_0) {
-            /* scrcpy exited: hand the exit code to the UI thread. Staying
-             * alive (error display, reconnect) is decided in WM_APP_PROCEXIT;
-             * procGen tags the message so a relaunched child never sees a
-             * stale exit. */
-            DWORD code = 0;
-            GetExitCodeProcess(g.hProc, &code);
-            if (g.hwnd) {
-                PostMessageW(g.hwnd, WM_APP_PROCEXIT, (WPARAM) code,
-                             (LPARAM) g.procGen);
+        /* wait on the ACTIVE child (g.hProc) plus every background session */
+        HANDLE hs[1 + SES_MAX];
+        int map[1 + SES_MAX];
+        int n = 0, i;
+        if (g.hProc) {
+            hs[n] = g.hProc;
+            map[n] = -1;
+            n++;
+        }
+        for (i = 0; i < SES_MAX; i++) {
+            if (g_ses[i].used && g_ses[i].hProc) {
+                hs[n] = g_ses[i].hProc;
+                map[n] = i;
+                n++;
             }
-            CloseHandle(g.hProc);
-            g.hProc = NULL;
+        }
+        DWORD r = MsgWaitForMultipleObjectsEx(n, hs, INFINITE, QS_ALLINPUT,
+                                              MWMO_INPUTAVAILABLE);
+        if (n && r >= WAIT_OBJECT_0 && r < (DWORD) (WAIT_OBJECT_0 + n)) {
+            int idx = map[r - WAIT_OBJECT_0];
+            DWORD code = 0;
+            GetExitCodeProcess(hs[r - WAIT_OBJECT_0], &code);
+            if (idx < 0) {
+                /* active child: the UI thread decides stay/reconnect/exit;
+                 * procGen tags the message against a relaunched child */
+                if (g.hwnd) {
+                    PostMessageW(g.hwnd, WM_APP_PROCEXIT, (WPARAM) code,
+                                 (LPARAM) g.procGen);
+                }
+                CloseHandle(g.hProc);
+                g.hProc = NULL;
+            } else {
+                struct Session *s = &g_ses[idx];
+                if (g.hwnd) {
+                    PostMessageW(g.hwnd, WM_APP_SESEXIT, (WPARAM) idx, 0);
+                }
+                CloseHandle(s->hProc);
+                s->hProc = NULL;
+            }
             continue;
         }
-        if (r == WAIT_OBJECT_0 + (g.hProc ? 1u : 0u)) {
+        if (r == WAIT_OBJECT_0 + (DWORD) n) {
             MSG msg;
             while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
                 if (msg.message == WM_QUIT) {
