@@ -1,5 +1,7 @@
 # scrdock — scrcpy 悬浮工具栏
 
+当前版本：**1.1.0**。
+
 纯 C / Win32 实现的 scrcpy 悬浮控制条。把 `scrdock.exe` 放到 scrcpy 所在目录
 （或任意目录，只要能找到 `scrcpy.exe`），运行后会：
 
@@ -160,7 +162,7 @@ build.bat D:\path\to\scrcpy\dist   :: 编译并复制到 scrcpy 目录
 
 ## 图标与资源
 
-`scrdock.ico`（16~256 共 7 个尺寸）经 `scrdock.rc` 内嵌进 exe（含 VERSIONINFO 1.0.0.0），
+`scrdock.ico`（16~256 共 7 个尺寸）经 `scrdock.rc` 内嵌进 exe（含 VERSIONINFO 1.1.0.0），
 窗口类也挂了该图标。ico 由 `mkicon.ps1` 矢量绘制生成（设计 = 产品自喻：
 左边一块投屏 + 右边贴一条工具栏，中间按钮绿色强调），改配色/布局后重跑即可再生成。
 
