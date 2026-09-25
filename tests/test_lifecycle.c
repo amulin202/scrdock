@@ -5,18 +5,19 @@ static const wchar_t *test_mode;
 static int test_result = -1;
 static HWND original_manager;
 static ULONGLONG click_deadline;
+static wchar_t expected_click_result[128];
 
 static VOID CALLBACK check_wireless_click(HWND hwnd, UINT msg, UINT_PTR id, DWORD time)
 {
     (void) msg; (void) time;
-    bool success = wcscmp(g.tipStatus, L"已断开无线连接: 192.0.2.10:5555") == 0;
+    bool success = wcscmp(g.tipStatus, expected_click_result) == 0;
     if (!success && GetTickCount64() < click_deadline) return;
     test_result = success ? 0 : 11;
     KillTimer(hwnd, id);
     PostMessageW(hwnd, WM_CLOSE, 0, 0);
 }
 
-static int run_wireless_click(void)
+static int run_wireless_click(const wchar_t *mode)
 {
     g_hInst = GetModuleHandleW(NULL);
     INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES};
@@ -30,12 +31,35 @@ static int run_wireless_click(void)
     wcscpy_s(g.devList->v[0].serial, 64, L"192.0.2.10:5555");
     wcscpy_s(g.devList->v[0].state, 16, L"device");
     mgr_open();
+    wchar_t field[80];
+    GetWindowTextW(m.wifiPort, field, 80);
+    if (wcscmp(field, L"5555") != 0) return 14;
+    bool connecting = wcscmp(mode, L"wireless-click") != 0;
+    if (connecting) {
+        struct WifiResult *r = calloc(1, sizeof(*r));
+        if (!r) return 15;
+        wcscpy_s(r->addr, 80, L"192.0.2.10:51234");
+        wndproc(g.hwnd, WM_APP_WIFIDONE, (WPARAM) r, 0);
+        GetWindowTextW(m.wifiEd, field, 80);
+        if (wcscmp(field, L"192.0.2.10") != 0) return 16;
+        GetWindowTextW(m.wifiPort, field, 80);
+        if (wcscmp(field, L"51234") != 0) return 17;
+        SetWindowTextW(m.wifiPort, L"0");
+        SendMessageW(m.wifiGo, BM_CLICK, 0, 0);
+        GetWindowTextW(m.status, field, 80);
+        if (!wcsstr(field, L"1–65535")) return 19;
+        const wchar_t *port = wcscmp(mode, L"wireless-custom") == 0 ? L"6000" : L"5555";
+        SetWindowTextW(m.wifiPort, port);
+        swprintf(expected_click_result, 128, L"connected to 192.0.2.10:%s", port);
+    } else {
+        wcscpy_s(expected_click_result, 128, L"已断开无线连接: 192.0.2.10:5555");
+    }
     ListView_SetItemState(m.lv, 0, LVIS_SELECTED | LVIS_FOCUSED,
                           LVIS_SELECTED | LVIS_FOCUSED);
     click_deadline = GetTickCount64() + 2500;
     SetTimer(g.hwnd, 901, 50, check_wireless_click);
     /* Exercise BUTTON -> page WM_COMMAND -> manager -> worker -> result. */
-    SendMessageW(m.wifiDisconnect, BM_CLICK, 0, 0);
+    SendMessageW(connecting ? m.wifiGo : m.wifiDisconnect, BM_CLICK, 0, 0);
     run_loop();
     free(g.devList);
     return test_result;
@@ -63,7 +87,7 @@ static VOID CALLBACK check_window_state(HWND hwnd, UINT msg, UINT_PTR id, DWORD 
 
 static int run_case(const wchar_t *mode)
 {
-    if (wcscmp(mode, L"wireless-click") == 0) return run_wireless_click();
+    if (wcsncmp(mode, L"wireless-", 9) == 0) return run_wireless_click(mode);
     test_mode = mode;
     g_hInst = GetModuleHandleW(NULL);
     INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES};
@@ -110,6 +134,12 @@ static int run_case(const wchar_t *mode)
 
 int wmain(int argc, wchar_t **argv)
 {
+    if (argc == 3 && wcscmp(argv[1], L"connect") == 0) {
+        if (wcscmp(argv[2], L"192.0.2.10:5555") != 0
+                && wcscmp(argv[2], L"192.0.2.10:6000") != 0) return 18;
+        wprintf(L"connected to %s\n", argv[2]);
+        return 0;
+    }
     /* Stand in for adb in the click test; validate the exact endpoint. */
     if (argc == 3 && wcscmp(argv[1], L"disconnect") == 0) {
         return wcscmp(argv[2], L"192.0.2.10:5555") == 0 ? 0 : 13;
@@ -118,7 +148,8 @@ int wmain(int argc, wchar_t **argv)
     wchar_t exe[MAX_PATH];
     if (!GetModuleFileNameW(NULL, exe, MAX_PATH)) return 1;
     const wchar_t *cases[] = {L"empty", L"pending", L"lost", L"docked",
-                             L"activate-existing", L"activate-new", L"wireless-click"};
+                             L"activate-existing", L"activate-new", L"wireless-click",
+                             L"wireless-default", L"wireless-custom"};
     int failures = 0;
     for (int i = 0; i < (int) (sizeof(cases) / sizeof(cases[0])); i++) {
         wchar_t cmd[MAX_PATH + 64];

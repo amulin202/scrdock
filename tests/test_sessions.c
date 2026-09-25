@@ -344,6 +344,26 @@ static void test_wireless_disconnect(void)
     puts("PASS wireless disconnect: selected endpoint only, cancel retries, reject USB, report failures");
 }
 
+static void test_wireless_address(void)
+{
+    wchar_t address[100];
+    CHECK(wifi_build_address(L"192.0.2.10", L"5555", address, 100));
+    CHECK(wcscmp(address, L"192.0.2.10:5555") == 0);
+    CHECK(wifi_build_address(L" 192.0.2.10 ", L"", address, 100));
+    CHECK(wcscmp(address, L"192.0.2.10:5555") == 0);
+    CHECK(wifi_build_address(L"192.0.2.10", L"6000", address, 100));
+    CHECK(wcscmp(address, L"192.0.2.10:6000") == 0);
+    CHECK(wifi_build_address(L"2001:db8::1", L"65535", address, 100));
+    CHECK(wcscmp(address, L"[2001:db8::1]:65535") == 0);
+    CHECK(wifi_build_address(L"[2001:db8::1]", L"1", address, 100));
+    CHECK(!wifi_build_address(L"192.0.2.10", L"0", address, 100));
+    CHECK(!wifi_build_address(L"192.0.2.10", L"65536", address, 100));
+    CHECK(!wifi_build_address(L"192.0.2.10", L"55x", address, 100));
+    CHECK(!wifi_build_address(L"192.0.2.10:5555", L"5555", address, 100));
+    CHECK(!wifi_build_address(L"192.0.2.10 --bad", L"5555", address, 100));
+    puts("PASS wireless address: default/custom ports, IPv6 and invalid input");
+}
+
 int main(void)
 {
     test_attachment();
@@ -355,6 +375,7 @@ int main(void)
     test_wifi_reconnect();
     test_launch_preserves_sessions();
     test_wireless_disconnect();
+    test_wireless_address();
     reset_state();
     puts("PASS all session regression tests");
     return 0;

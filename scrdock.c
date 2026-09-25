@@ -2207,7 +2207,7 @@ enum {
     MID_SCRCPY_ED, MID_SCRCPY_BR, MID_ADB_ED, MID_ADB_BR,
     MID_DETECT, MID_PATH_SAVE,
     MID_PAIR_ADDR, MID_PAIR_CODE, MID_PAIR_GO, MID_PAIR_QR_REFRESH,
-    MID_WIFI_DISCONNECT
+    MID_WIFI_DISCONNECT, MID_WIFI_PORT
 };
 
 static struct {
@@ -2218,7 +2218,7 @@ static struct {
     RECT closeRc;               /* self-drawn close cell in the header    */
     HWND page[MPAGE_COUNT];
     HWND lv, refresh, connect, remember, disconnect, status, errview;
-    HWND chkWireless, wifiEd, wifiGo, pairBtn, wifiDisconnect;
+    HWND chkWireless, wifiEd, wifiPort, wifiGo, pairBtn, wifiDisconnect;
     HWND bitrate, maxsize, maxfps, chkScreenOff, chkStayAwake, chkNoAudio,
          chkTouch, chkReconn, reconnN, chkCloseExit, extra, optSave;
     HWND scrcpyEd, scrcpyBr, adbEd, adbBr, detect, pathSave, detectOut;
@@ -2790,8 +2790,15 @@ static void mgr_create_dev_page(HWND page, UINT dpi)
                           MG_BTN_H_96, MID_CHK_WIRELESS, dpi);
     SendMessageW(m.chkWireless, BM_SETCHECK,
                  g.cfg.wireless ? BST_CHECKED : BST_UNCHECKED, 0);
+    mgr_label(page, dpi, L"IP", 120, 276, 22);
     m.wifiEd = mkctl(page, L"EDIT", ES_AUTOHSCROLL | WS_TABSTOP,
-                     L"", 120, 276, 260, MG_BTN_H_96, MID_WIFI_ED, dpi);
+                     L"", 144, 276, 132, MG_BTN_H_96, MID_WIFI_ED, dpi);
+    SendMessageW(m.wifiEd, EM_SETCUEBANNER, TRUE, (LPARAM) L"手机 IP 地址");
+    SendMessageW(m.wifiEd, EM_SETLIMITTEXT, 63, 0);
+    mgr_label(page, dpi, L"端口", 282, 276, 34);
+    m.wifiPort = mkctl(page, L"EDIT", ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP,
+                       L"5555", 318, 276, 62, MG_BTN_H_96, MID_WIFI_PORT, dpi);
+    SendMessageW(m.wifiPort, EM_SETLIMITTEXT, 10, 0);
     m.wifiGo = mgr_button(page, dpi, L"连接", 398, 276, 80, MID_WIFI_GO);
     m.pairBtn = mgr_button(page, dpi, L"配对…", 486, 276, 74, MID_PAIR);
 
@@ -3111,6 +3118,59 @@ static void mdns_discover_and_connect(struct WifiResult *r)
             || strncmp(output, "already connected to ", 21) == 0);
     wifi_append(r, connected ? L"\r\n已连接 " : L"\r\n自动连接失败，请核对配对状态及地址：");
     wifi_append(r, addrs[0]);
+}
+
+static bool wifi_build_address(const wchar_t *host, const wchar_t *port,
+                                wchar_t *out, size_t cch)
+{
+    wchar_t ip[80];
+    while (*host == L' ' || *host == L'\t') host++;
+    size_t n = wcslen(host);
+    while (n && (host[n - 1] == L' ' || host[n - 1] == L'\t')) n--;
+    if (!n || n >= 64) return false;
+    wmemcpy(ip, host, n);
+    ip[n] = L'\0';
+    int colons = 0;
+    for (size_t i = 0; i < n; i++) {
+        wchar_t ch = ip[i];
+        if (ch == L':') colons++;
+        if (!((ch >= L'0' && ch <= L'9') || (ch >= L'a' && ch <= L'z')
+                || (ch >= L'A' && ch <= L'Z') || wcschr(L".-_:%[]", ch))) return false;
+    }
+    /* A single colon is an accidentally pasted IPv4:port, not an IPv6 host. */
+    if (colons == 1) return false;
+    bool bracketed = ip[0] == L'[';
+    if (bracketed) {
+        if (n < 4 || ip[n - 1] != L']' || colons < 2) return false;
+        for (size_t i = 1; i < n - 1; i++) if (ip[i] == L'[' || ip[i] == L']') return false;
+    } else if (wcschr(ip, L'[') || wcschr(ip, L']')) return false;
+    while (*port == L' ' || *port == L'\t') port++;
+    unsigned value = 0;
+    bool digits = false;
+    while (*port >= L'0' && *port <= L'9') {
+        digits = true;
+        value = value * 10 + (unsigned) (*port++ - L'0');
+        if (value > 65535) return false;
+    }
+    while (*port == L' ' || *port == L'\t') port++;
+    if (*port) return false;
+    if (!digits) value = 5555;
+    if (!value) return false;
+    int written = swprintf(out, cch, colons >= 2 && !bracketed ? L"[%s]:%u" : L"%s:%u", ip, value);
+    return written > 0 && (size_t) written < cch;
+}
+
+static void wifi_fill_address(const wchar_t *address)
+{
+    const wchar_t *colon = wcsrchr(address, L':');
+    if (!colon || colon == address || (size_t) (colon - address) >= 64) return;
+    wchar_t host[80], check[100];
+    size_t n = (size_t) (colon - address);
+    wmemcpy(host, address, n);
+    host[n] = L'\0';
+    if (!wifi_build_address(host, colon + 1, check, 100)) return;
+    if (m.wifiEd) SetWindowTextW(m.wifiEd, host);
+    if (m.wifiPort) SetWindowTextW(m.wifiPort, colon + 1);
 }
 
 static bool wifi_prepare_disconnect(const wchar_t *serial)
@@ -4092,13 +4152,13 @@ static LRESULT CALLBACK mgr_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     *--e = L'\0';
                 }
                 if (a[0]) {
-                    wchar_t addr[84];
-                    if (!wcschr(a, L':')) {
-                        swprintf(addr, 84, L"%s:5555", a);
-                    } else {
-                        wcsncpy(addr, a, 83);
-                        addr[83] = L'\0';
+                    wchar_t addr[84], port[16];
+                    GetWindowTextW(m.wifiPort, port, 16);
+                    if (!wifi_build_address(a, port, addr, 84)) {
+                        SetWindowTextW(m.status, L"请分别填写 IP 地址和端口（1–65535，默认 5555）");
+                        break;
                     }
+                    SetWindowTextW(m.wifiPort, wcsrchr(addr, L':') + 1);
                     SetWindowTextW(m.status, L"连接中…");
                     wifi_spawn_cmd(0, addr, NULL);
                 } else {
@@ -5047,7 +5107,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             struct WifiResult *r = (struct WifiResult *) wp;
             if (r) {
                 if (r->addr[0] && m.wifiEd && IsWindow(m.wifiEd)) {
-                    SetWindowTextW(m.wifiEd, r->addr);
+                    wifi_fill_address(r->addr);
                 }
                 if (r->pair && p.out && IsWindow(p.out)) {
                     SetWindowTextW(p.out, r->text);
