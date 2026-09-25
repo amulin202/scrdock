@@ -6,6 +6,102 @@ static int test_result = -1;
 static HWND original_manager;
 static ULONGLONG click_deadline;
 static wchar_t expected_click_result[128];
+static unsigned list_writes, list_deletes, list_inserts;
+
+static LRESULT CALLBACK count_list_updates(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
+                                           UINT_PTR id, DWORD_PTR data)
+{
+    (void) id; (void) data;
+    if (msg == LVM_DELETEALLITEMS || msg == LVM_DELETEITEM) list_deletes++;
+    if (msg == LVM_INSERTITEMW) list_inserts++;
+    if (msg == LVM_SETITEMTEXTW || msg == LVM_SETITEMW
+            || msg == LVM_SETITEMSTATE || msg == WM_SETREDRAW) list_writes++;
+    return DefSubclassProc(hwnd, msg, wp, lp);
+}
+
+static int run_list_refresh(void)
+{
+    g_hInst = GetModuleHandleW(NULL);
+    INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES};
+    InitCommonControlsEx(&icc);
+    register_and_create();
+    g.devList = calloc(1, sizeof(*g.devList));
+    if (!g.devList) return 20;
+    g.devList->count = DEV_MAX;
+    for (int i = 0; i < DEV_MAX; i++) {
+        swprintf(g.devList->v[i].serial, 64, L"device-%d", i);
+        wcscpy_s(g.devList->v[i].state, 16, L"device");
+    }
+    wcscpy_s(g.serial, 128, L"device-0");
+    mgr_open();
+    SetWindowPos(m.lv, NULL, 0, 0, 400, 100, SWP_NOMOVE | SWP_NOZORDER);
+    ListView_SetItemState(m.lv, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+    ListView_SetItemState(m.lv, 6, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+    ListView_EnsureVisible(m.lv, 6, FALSE);
+    ListView_Scroll(m.lv, 80, 0);
+    int top = ListView_GetTopIndex(m.lv), scroll = GetScrollPos(m.lv, SB_HORZ);
+    SetWindowTextW(m.wifiEd, L"192.0.2.10");
+    SetWindowTextW(m.wifiPort, L"6000");
+    SetFocus(m.wifiEd);
+    if (!SetWindowSubclass(m.lv, count_list_updates, 1, 0)) return 21;
+    for (int i = 0; i < 50; i++) mgr_refresh();
+    wchar_t selected[64], text[80];
+    if (list_writes || list_deletes || list_inserts) return 22;
+    if (!mgr_selected_serial(selected, 64) || wcscmp(selected, L"device-6")) return 23;
+    if (ListView_GetTopIndex(m.lv) != top || GetScrollPos(m.lv, SB_HORZ) != scroll) return 24;
+    if (GetFocus() != m.wifiEd) return 25;
+    GetWindowTextW(m.wifiEd, text, 80);
+    if (wcscmp(text, L"192.0.2.10")) return 26;
+    GetWindowTextW(m.wifiPort, text, 80);
+    if (wcscmp(text, L"6000")) return 27;
+
+    /* Metadata/state changes must update cells without replacing rows. */
+    wcscpy_s(g.devList->v[6].state, 16, L"offline");
+    g.devMeta.count = 1;
+    wcscpy_s(g.devMeta.v[0].serial, 64, L"device-6");
+    wcscpy_s(g.devMeta.v[0].model, 64, L"updated model");
+    g.devMeta.v[0].battery = -1;
+    mgr_refresh();
+    if (list_deletes || list_inserts || !mgr_selected_serial(selected, 64)
+            || wcscmp(selected, L"device-6")) return 28;
+    ListView_GetItemText(m.lv, 6, 2, text, 80);
+    if (wcscmp(text, L"updated model")) return 29;
+
+    /* ADB can reorder its snapshot; user selection follows identity, not index. */
+    struct DevList *reordered = malloc(sizeof(*reordered));
+    if (!reordered) return 30;
+    *reordered = *g.devList;
+    for (int i = 0; i < DEV_MAX; i++) reordered->v[i] = g.devList->v[DEV_MAX - i - 1];
+    devlist_apply(reordered);
+    if (list_deletes || list_inserts || !mgr_selected_serial(selected, 64)
+            || wcscmp(selected, L"device-6")) return 31;
+    if (ListView_GetTopIndex(m.lv) != top || GetScrollPos(m.lv, SB_HORZ) != scroll) return 32;
+
+    /* Removing a different row above the viewport preserves selection and anchor. */
+    wchar_t anchor[64], after_anchor[64];
+    ListView_GetItemText(m.lv, ListView_GetTopIndex(m.lv), 1, anchor, 64);
+    g.devList->count--; /* reversed snapshot ends with device-0 */
+    mgr_refresh();
+    ListView_GetItemText(m.lv, ListView_GetTopIndex(m.lv), 1, after_anchor, 64);
+    if (!mgr_selected_serial(selected, 64) || wcscmp(selected, L"device-6")
+            || wcscmp(anchor, after_anchor) || GetScrollPos(m.lv, SB_HORZ) != scroll) return 35;
+
+    /* Removing the selected device must not silently select another device. */
+    for (int i = 1; i < g.devList->count - 1; i++) g.devList->v[i] = g.devList->v[i + 1];
+    g.devList->count--;
+    mgr_refresh();
+    if (mgr_selected_serial(selected, 64) || list_deletes != 2 || list_inserts) return 33;
+    /* New devices are appended while existing rows keep their identity/order. */
+    wcscpy_s(g.devList->v[g.devList->count].serial, 64, L"new-device");
+    wcscpy_s(g.devList->v[g.devList->count].state, 16, L"device");
+    g.devList->count++;
+    mgr_refresh();
+    if (list_deletes != 2 || list_inserts != 1 || mgr_selected_serial(selected, 64)) return 34;
+    PostMessageW(g.hwnd, WM_CLOSE, 0, 0);
+    int result = run_loop();
+    free(g.devList);
+    return result;
+}
 
 static VOID CALLBACK check_wireless_click(HWND hwnd, UINT msg, UINT_PTR id, DWORD time)
 {
@@ -87,6 +183,7 @@ static VOID CALLBACK check_window_state(HWND hwnd, UINT msg, UINT_PTR id, DWORD 
 
 static int run_case(const wchar_t *mode)
 {
+    if (wcscmp(mode, L"list-refresh") == 0) return run_list_refresh();
     if (wcsncmp(mode, L"wireless-", 9) == 0) return run_wireless_click(mode);
     test_mode = mode;
     g_hInst = GetModuleHandleW(NULL);
@@ -149,7 +246,7 @@ int wmain(int argc, wchar_t **argv)
     if (!GetModuleFileNameW(NULL, exe, MAX_PATH)) return 1;
     const wchar_t *cases[] = {L"empty", L"pending", L"lost", L"docked",
                              L"activate-existing", L"activate-new", L"wireless-click",
-                             L"wireless-default", L"wireless-custom"};
+                             L"wireless-default", L"wireless-custom", L"list-refresh"};
     int failures = 0;
     for (int i = 0; i < (int) (sizeof(cases) / sizeof(cases[0])); i++) {
         wchar_t cmd[MAX_PATH + 64];

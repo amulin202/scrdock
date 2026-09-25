@@ -2444,60 +2444,121 @@ static const wchar_t *dev_conn_text(const wchar_t *serial)
     return L"USB";
 }
 
+static int dev_index_of(const wchar_t *serial)
+{
+    if (g.devList) {
+        for (int i = 0; i < g.devList->count; i++) {
+            if (wcscmp(g.devList->v[i].serial, serial) == 0) return i;
+        }
+    }
+    return -1;
+}
+
+static int mgr_row_of(const wchar_t *serial)
+{
+    wchar_t current[64];
+    for (int i = 0; i < ListView_GetItemCount(m.lv); i++) {
+        ListView_GetItemText(m.lv, i, 1, current, 64);
+        if (wcscmp(current, serial) == 0) return i;
+    }
+    return -1;
+}
+
+static void mgr_list_changing(bool *changed)
+{
+    if (!*changed) {
+        SendMessageW(m.lv, WM_SETREDRAW, FALSE, 0);
+        *changed = true;
+    }
+}
+
+static void mgr_set_cell(int row, int column, const wchar_t *text, bool *changed)
+{
+    wchar_t current[128];
+    ListView_GetItemText(m.lv, row, column, current, 128);
+    if (wcscmp(current, text) != 0) {
+        mgr_list_changing(changed);
+        ListView_SetItemText(m.lv, row, column, (LPWSTR) text);
+    }
+}
+
 static void mgr_list_reload(void)
 {
-    int i;
     if (!m.lv || !g.devList) {
         return;
     }
-    SendMessageW(m.lv, WM_SETREDRAW, FALSE, 0);
-    ListView_DeleteAllItems(m.lv);
-    int selItem = -1;
-    for (i = 0; i < g.devList->count; i++) {
+    int count = ListView_GetItemCount(m.lv);
+    int top = ListView_GetTopIndex(m.lv);
+    int scroll = GetScrollPos(m.lv, SB_HORZ);
+    RECT top_rect = {0};
+    wchar_t top_serial[64] = L"", selected[64] = L"";
+    int selected_row = ListView_GetNextItem(m.lv, -1, LVNI_SELECTED);
+    if (selected_row >= 0) ListView_GetItemText(m.lv, selected_row, 1, selected, 64);
+    if (count && ListView_GetItemRect(m.lv, top, &top_rect, LVIR_BOUNDS)) {
+        ListView_GetItemText(m.lv, top, 1, top_serial, 64);
+    }
+    bool changed = false, structural = false;
+    /* Keep existing rows in place; a fresh ADB snapshot may have a different order. */
+    for (int row = count - 1; row >= 0; row--) {
+        wchar_t serial[64];
+        ListView_GetItemText(m.lv, row, 1, serial, 64);
+        if (dev_index_of(serial) < 0) {
+            mgr_list_changing(&changed);
+            ListView_DeleteItem(m.lv, row);
+            structural = true;
+        }
+    }
+    for (int i = 0; i < g.devList->count; i++) {
         struct DevInfo *d = &g.devList->v[i];
         struct DevMeta *dm = meta_find(d->serial);
-        wchar_t battery[16];
-        wchar_t android[32];
-        LVITEMW it;
-        ZeroMemory(&it, sizeof(it));
-        it.mask = LVIF_TEXT | LVIF_PARAM;
-        it.iItem = i;
-        it.iSubItem = 0;
-        it.pszText = (LPWSTR) dev_state_text(d->state);
-        it.lParam = (LPARAM) i;
-        ListView_InsertItem(m.lv, &it);
-        ListView_SetItemText(m.lv, i, 1, d->serial);
-        ListView_SetItemText(m.lv, i, 2, dm ? dm->model : (LPWSTR) L"—");
+        int row = mgr_row_of(d->serial);
+        if (row < 0) {
+            LVITEMW it = {0};
+            it.mask = LVIF_TEXT;
+            it.iItem = ListView_GetItemCount(m.lv);
+            it.pszText = (LPWSTR) dev_state_text(d->state);
+            mgr_list_changing(&changed);
+            row = ListView_InsertItem(m.lv, &it);
+            if (row < 0) continue;
+            structural = true;
+        }
+        wchar_t battery[16] = L"—", android[32] = L"—";
         if (dm && dm->android[0]) {
             swprintf(android, 32, L"Android %s", dm->android);
-            ListView_SetItemText(m.lv, i, 3, android);
-        } else {
-            ListView_SetItemText(m.lv, i, 3, (LPWSTR) L"—");
         }
-        ListView_SetItemText(m.lv, i, 4, (LPWSTR) dev_conn_text(d->serial));
         if (dm && dm->battery >= 0) {
             swprintf(battery, 16, L"%d%%", dm->battery);
-            ListView_SetItemText(m.lv, i, 5, battery);
-        } else {
-            ListView_SetItemText(m.lv, i, 5, (LPWSTR) L"—");
         }
-        {
-            int sx = ses_find(d->serial);
-            ListView_SetItemText(m.lv, i, 6,
-                sx < 0 ? (LPWSTR) L""
-                : (sx == g_active ? (LPWSTR) L"●当前" : (LPWSTR) L"●"));
-        }
-        if (wcscmp(d->serial, g.serial) == 0) {
-            selItem = i;
+        int sx = ses_find(d->serial);
+        mgr_set_cell(row, 0, dev_state_text(d->state), &changed);
+        mgr_set_cell(row, 1, d->serial, &changed);
+        mgr_set_cell(row, 2, dm ? dm->model : L"—", &changed);
+        mgr_set_cell(row, 3, android, &changed);
+        mgr_set_cell(row, 4, dev_conn_text(d->serial), &changed);
+        mgr_set_cell(row, 5, battery, &changed);
+        mgr_set_cell(row, 6, sx < 0 ? L"" : (sx == g_active ? L"●当前" : L"●"), &changed);
+    }
+    if (selected[0] && dev_index_of(selected) < 0) {
+        /* Disappearing devices must not redirect the next button click. */
+        ListView_SetItemState(m.lv, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+    } else if (count == 0 && g.serial[0]) {
+        int row = mgr_row_of(g.serial);
+        if (row >= 0) {
+            ListView_SetItemState(m.lv, row, LVIS_SELECTED | LVIS_FOCUSED,
+                                  LVIS_SELECTED | LVIS_FOCUSED);
         }
     }
-    if (selItem >= 0) {
-        ListView_SetItemState(m.lv, selItem,
-                              LVIS_SELECTED | LVIS_FOCUSED,
-                              LVIS_SELECTED | LVIS_FOCUSED);
+    if (changed) {
+        SendMessageW(m.lv, WM_SETREDRAW, TRUE, 0);
+        if (structural && top_serial[0]) {
+            int row = mgr_row_of(top_serial);
+            RECT now;
+            if (row >= 0 && ListView_GetItemRect(m.lv, row, &now, LVIR_BOUNDS)) {
+                ListView_Scroll(m.lv, scroll - GetScrollPos(m.lv, SB_HORZ), now.top - top_rect.top);
+            }
+        }
+        InvalidateRect(m.lv, NULL, FALSE);
     }
-    SendMessageW(m.lv, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(m.lv, NULL, FALSE);
 }
 
 static void mgr_update_status(void)
@@ -2552,27 +2613,17 @@ static void mgr_refresh(void)
 /* selected list row's serial (true on success) */
 static bool mgr_selected_serial(wchar_t *out, size_t cch)
 {
-    LVITEMW vi;
-    int it, di;
-    if (!m.lv || !g.devList) {
+    if (!m.lv || !g.devList || !cch) {
         return false;
     }
-    it = ListView_GetNextItem(m.lv, -1, LVNI_SELECTED);
+    int it = ListView_GetNextItem(m.lv, -1, LVNI_SELECTED);
     if (it < 0) {
         return false;
     }
-    ZeroMemory(&vi, sizeof(vi));
-    vi.mask = LVIF_PARAM;
-    vi.iItem = it;
-    if (!ListView_GetItem(m.lv, &vi)) {
-        return false;
-    }
-    di = (int) vi.lParam;
-    if (di < 0 || di >= g.devList->count) {
-        return false;
-    }
-    wcsncpy(out, g.devList->v[di].serial, cch - 1);
-    out[cch - 1] = L'\0';
+    wchar_t serial[64];
+    ListView_GetItemText(m.lv, it, 1, serial, 64);
+    if (dev_index_of(serial) < 0 || wcslen(serial) >= cch) return false;
+    wcscpy_s(out, cch, serial);
     return true;
 }
 
