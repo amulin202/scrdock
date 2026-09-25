@@ -6,12 +6,15 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <wchar.h>
 
 static bool timers[16], fail_launch;
 static int launches, posted;
 static wchar_t last_command[2048];
 static DWORD process_exit_code;
+static const char *capture_output;
+static HANDLE inherited_output;
 
 static BOOL WINAPI fake_exit_code(HANDLE process, LPDWORD code)
 { (void) process; *code = process_exit_code; return TRUE; }
@@ -38,6 +41,13 @@ static BOOL WINAPI fake_create_process(LPCWSTR app, LPWSTR cmd,
     launches++;
     wcscpy_s(last_command, 2048, cmd);
     if (fail_launch) { SetLastError(ERROR_FILE_NOT_FOUND); return FALSE; }
+    if (capture_output) {
+        DWORD written;
+        if (!WriteFile(si->hStdOutput, capture_output, (DWORD) strlen(capture_output), &written, NULL)) return FALSE;
+        /* Keep a second writer handle alive like an unrelated concurrent child. */
+        if (!DuplicateHandle(GetCurrentProcess(), si->hStdOutput, GetCurrentProcess(),
+                             &inherited_output, 0, FALSE, DUPLICATE_SAME_ACCESS)) return FALSE;
+    }
     pi->hProcess = CreateEventW(NULL, TRUE, TRUE, NULL);
     pi->hThread = CreateEventW(NULL, TRUE, TRUE, NULL);
     pi->dwProcessId = 1234;
@@ -80,6 +90,9 @@ static HWINEVENTHOOK WINAPI fake_hook(DWORD first, DWORD last, HMODULE module,
 
 static void reset_state(void)
 {
+    if (inherited_output) CloseHandle(inherited_output);
+    inherited_output = NULL;
+    capture_output = NULL;
     if (g.hProc) CloseHandle(g.hProc);
     if (g.hErr) CloseHandle(g.hErr);
     free(g.devList);
@@ -364,6 +377,27 @@ static void test_wireless_address(void)
     puts("PASS wireless address: default/custom ports, IPv6 and invalid input");
 }
 
+static void test_device_capture(void)
+{
+    reset_state();
+    capture_output = "List of devices attached\r\nUSB-A\tdevice\r\n192.0.2.10:5555\toffline\r\n\r\n";
+    char output[512];
+    DWORD code = 1;
+    CHECK(capture_sync(L"fake-adb devices", output, sizeof(output), 1000, &code));
+    CHECK(code == 0 && strcmp(output, capture_output) == 0);
+    CHECK(inherited_output && WaitForSingleObject(inherited_output, 0) != WAIT_FAILED);
+    struct DevList dl = {0};
+    CHECK(devlist_parse(output, &dl) && dl.count == 2);
+    CHECK(!devlist_parse("", &dl) && dl.count == 2);
+    CHECK(!devlist_parse("error: daemon unavailable\n", &dl) && dl.count == 2);
+    CHECK(!devlist_parse("List of devices attached\nUSB-A\tdev", &dl) && dl.count == 2);
+    CHECK(!devlist_parse("List of devices attached", &dl) && dl.count == 2);
+    CHECK(devlist_parse("* daemon started successfully *\nList of devices attached\nUSB-A\tdevice\n", &dl));
+    CHECK(dl.count == 1);
+    CHECK(devlist_parse("List of devices attached\r\n\r\n", &dl) && dl.count == 0);
+    puts("PASS device capture: inherited writer, valid empty snapshots, reject failed/truncated captures");
+}
+
 int main(void)
 {
     test_attachment();
@@ -376,6 +410,7 @@ int main(void)
     test_launch_preserves_sessions();
     test_wireless_disconnect();
     test_wireless_address();
+    test_device_capture();
     reset_state();
     puts("PASS all session regression tests");
     return 0;

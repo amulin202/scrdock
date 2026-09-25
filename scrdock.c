@@ -981,7 +981,8 @@ static bool capture_sync_cancel(const wchar_t *cmdline, char *out, DWORD cb_out,
     sa.nLength = sizeof(sa);
     sa.lpSecurityDescriptor = NULL;
     sa.bInheritHandle = TRUE;
-    hf = CreateFileW(tmp_file, GENERIC_WRITE, FILE_SHARE_READ, &sa,
+    hf = CreateFileW(tmp_file, GENERIC_READ | GENERIC_WRITE,
+                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, &sa,
                      TRUNCATE_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hf == INVALID_HANDLE_VALUE) {
         DeleteFileW(tmp_file);
@@ -1003,12 +1004,11 @@ static bool capture_sync_cancel(const wchar_t *cmdline, char *out, DWORD cb_out,
         HANDLE waits[2] = {pi.hProcess, stop};
         if (WaitForMultipleObjects(stop ? 2 : 1, waits, FALSE, timeout_ms)
                 == WAIT_OBJECT_0) {
-            DWORD ec = 0;
-            GetExitCodeProcess(pi.hProcess, &ec);
+            DWORD ec = (DWORD) -1;
+            ok = GetExitCodeProcess(pi.hProcess, &ec) != FALSE;
             if (exit_code) {
                 *exit_code = ec;
             }
-            ok = true;
         } else {
             TerminateProcess(pi.hProcess, 1);
             WaitForSingleObject(pi.hProcess, INFINITE);
@@ -1016,19 +1016,18 @@ static bool capture_sync_cancel(const wchar_t *cmdline, char *out, DWORD cb_out,
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
     }
-    CloseHandle(hf);
-
     if (ok && out && cb_out > 0) {
-        HANDLE hr = CreateFileW(tmp_file, GENERIC_READ, FILE_SHARE_READ, NULL,
-                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (hr != INVALID_HANDLE_VALUE) {
-            DWORD rd = 0;
-            out[0] = '\0';
-            ReadFile(hr, out, cb_out - 1, &rd, NULL);
-            out[rd] = '\0';
-            CloseHandle(hr);
-        }
+        /* Concurrent children may still hold an inherited copy of this handle.
+         * Reopening without FILE_SHARE_WRITE used to fail and silently yield
+         * an empty device list. Read the original handle and propagate errors. */
+        LARGE_INTEGER start;
+        start.QuadPart = 0;
+        DWORD rd = 0;
+        ok = SetFilePointerEx(hf, start, NULL, FILE_BEGIN)
+             && ReadFile(hf, out, cb_out - 1, &rd, NULL);
+        out[rd] = '\0';
     }
+    CloseHandle(hf);
     DeleteFileW(tmp_file);
     return ok;
 }
@@ -1270,12 +1269,21 @@ static void err_last_line(wchar_t *out, size_t cch)
 
 /* "adb devices" output lines: "List of devices attached", then one
  * "<serial>\t<state>" per device (state: device/offline/unauthorized/...). */
-static void devlist_parse(const char *text, struct DevList *dl)
+static bool devlist_parse(const char *text, struct DevList *dl)
 {
-    char *dup = _strdup(text ? text : "");
+    /* An empty/partial capture is not an authoritative empty device snapshot. */
+    const char marker[] = "List of devices attached";
+    if (!text || !text[0]) return false;
+    size_t len = strlen(text);
+    const char *header = strstr(text, marker);
+    if (!header || (header != text && header[-1] != '\n' && header[-1] != '\r')
+            || (header[sizeof(marker) - 1] != '\r' && header[sizeof(marker) - 1] != '\n')
+            || text[len - 1] != '\n') return false;
+    char *dup = _strdup(header + sizeof(marker) - 1);
     if (!dup) {
-        return;
+        return false;
     }
+    ZeroMemory(dl, sizeof(*dl));
     char *ctx = NULL;
     char *line = strtok_s(dup, "\r\n", &ctx);
     while (line && dl->count < DEV_MAX) {
@@ -1292,6 +1300,7 @@ static void devlist_parse(const char *text, struct DevList *dl)
         line = strtok_s(NULL, "\r\n", &ctx);
     }
     free(dup);
+    return true;
 }
 
 /* Poll "adb devices" every 1.5 s and post a fresh DevList when it changed.
@@ -1314,11 +1323,9 @@ static unsigned __stdcall track_thread(void *arg)
     swprintf(cmd, MAX_PATH + 32, L"\"%s\" devices", g.adbPath);
     for (;;) {
         buf[0] = '\0';
+        struct DevList dl;
         if (capture_sync_cancel(cmd, buf, sizeof(buf), 10000, &ec, g.trackStop)
-                && ec == 0) {
-            struct DevList dl;
-            ZeroMemory(&dl, sizeof(dl));
-            devlist_parse(buf, &dl);
+                && ec == 0 && devlist_parse(buf, &dl)) {
             if (!have_last || memcmp(&last, &dl, sizeof(dl)) != 0) {
                 struct DevList *heap_dl = malloc(sizeof(*heap_dl));
                 if (heap_dl) {
