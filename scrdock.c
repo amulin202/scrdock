@@ -62,7 +62,7 @@
 #define WM_APP_PROCEXIT (WM_APP + 4)  /* wp: exit code, lp: proc gen   */
 #define WM_APP_DETECTED (WM_APP + 5)  /* wp: heap wchar[] text         */
 #define WM_APP_WIFIDONE (WM_APP + 6)  /* wp: heap WifiResult*          */
-#define WM_APP_SESEXIT  (WM_APP + 7)  /* wp: session index             */
+#define WM_APP_SESEXIT  (WM_APP + 7)  /* wp: session index, lp: exit code */
 #define WM_APP_QREVENT  (WM_APP + 8)  /* lp: owned struct QrEvent* */
 
 #define TIMER_HUNT  1  /* 200 ms: poll for the scrcpy window            */
@@ -70,6 +70,7 @@
 #define TIMER_FLASH 3  /* 1.2 s: screenshot result flash                */
 #define TIMER_TIP   4  /* 350 ms: tooltip dwell delay                   */
 #define TIMER_RECONN 5 /* 1.5 s: one-shot reconnect delay               */
+#define TIMER_BG_RECONN 6 /* 1.5 s: reconnect background sessions       */
 
 #define IDM_REDOCK 100
 #define IDM_EXIT   101
@@ -180,6 +181,7 @@ struct Scrdock {
     bool manual;            /* user dragged the toolbar away        */
     bool shotBusy;
     bool launched;          /* we started scrcpy (vs attached)      */
+    bool attached;          /* foreign process: device identity is unknown */
     bool shown;
     bool everDocked;
     bool closing;
@@ -244,6 +246,7 @@ struct Session {
     int reconnAttempts;
     bool reconnPending;
     bool pinned_mod;
+    bool stopRequested;     /* explicit disconnect must not reconnect */
 };
 
 static struct Session g_ses[SES_MAX];
@@ -312,6 +315,7 @@ static void meta_spawn(void);
 static bool dev_online(const wchar_t *serial);
 static void reconn_arm(void);
 static void ses_become_active(int idx);
+static bool ses_disconnect_selected(const wchar_t *serial);
 
 /* ------------------------------------------------------------------ */
 /* small utilities                                                     */
@@ -756,6 +760,9 @@ static bool launch_scrcpy_ex(const wchar_t *serial, bool activate)
             cur->pinned_mod = g.pinned_mod;
             wcsncpy(cur->serial, g.serial, 63);
             cur->serial[63] = L'\0';
+            if (cur->reconnPending && !cur->hProc) {
+                SetTimer(g.hwnd, TIMER_BG_RECONN, 1500, NULL);
+            }
         } else if (g.hProc) {
             /* same session relaunched: retire its previous child */
             CloseHandle(g.hProc);
@@ -769,19 +776,23 @@ static bool launch_scrcpy_ex(const wchar_t *serial, bool activate)
     slot->pid = pi.dwProcessId;
     slot->launchTick = GetTickCount64();
     slot->gen = ++g_genSeq;
-    slot->reconnAttempts = 0;
+    if (!slot->reconnPending) slot->reconnAttempts = 0;
     slot->reconnPending = false;
     slot->pinned_mod = pinned_mod;
+    slot->stopRequested = false;
+    slot->target = NULL;
 
     if (activate) {
         g.hErr = rd;
         g.hProc = pi.hProcess;
         g.pid = slot->pid;
         g.launched = true;
+        g.attached = false;
         g.pinned_mod = pinned_mod;
         g.scrW = g.scrH = 0;
         g.launchTick = slot->launchTick;
         g.procGen = slot->gen;
+        if (idx != g_active) g.reconnAttempts = slot->reconnAttempts;
         g.reconnPending = false;
         wcsncpy(g.serial, serial, 127);
         g.serial[127] = L'\0';
@@ -866,7 +877,7 @@ struct AdbWork {
 
 static struct AdbWork *adb_work_new(void)
 {
-    if (!g.adbOk || !g.serial[0]) return NULL;
+    if (g.attached || !g.adbOk || !g.serial[0]) return NULL;
     struct AdbWork *w = calloc(1, sizeof(*w));
     if (w) {
         wcscpy_s(w->adb, MAX_PATH, g.adbPath);
@@ -2493,7 +2504,9 @@ static void mgr_update_status(void)
         return;
     }
     wchar_t run[320];
-    if (g.hProc) {
+    if (g.attached) {
+        wcscpy(run, L"附着会话设备未确认，请选择设备并连接");
+    } else if (g.hProc) {
         swprintf(run, 320, L"运行中 (pid %lu)", g.pid);
     } else if (g.reconnPending) {
         swprintf(run, 320, L"等待设备上线重连 (%d/%d)",
@@ -2584,10 +2597,14 @@ static void mgr_connect_selected(void)
     }
     if (idx >= 0 && idx != g_active) {
         ses_become_active(idx); /* running: just switch the toolbar to it */
-        if (g.hProc) {
-            swprintf(g.tipStatus, TIP_STATUS_LEN, L"已切换到 %s", serial);
-            return;
+        if (g_active == idx) {
+            swprintf(g.tipStatus, TIP_STATUS_LEN,
+                     g.hProc ? L"已切换到 %s" : L"等待设备上线重连: %s", serial);
+        } else {
+            wcscpy(g.tipStatus, L"切换失败：所选设备的 scrcpy 启动失败");
         }
+        mgr_refresh();
+        return;
     }
     g.reconnAttempts = 0;
     if (!launch_scrcpy_ex(serial, true)) {
@@ -3993,49 +4010,10 @@ static LRESULT CALLBACK mgr_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case MID_DISCONNECT:
             {
                 wchar_t serial[64];
-                int idx = -1;
-                if (mgr_selected_serial(serial, 64)) {
-                    idx = ses_find(serial);
+                if (ses_disconnect_selected(mgr_selected_serial(serial, 64)
+                                             ? serial : NULL)) {
+                    wcscpy(g.tipStatus, L"已断开会话");
                 }
-                if (idx < 0 || idx == g_active) {
-                    /* active session (or none selected): graceful close,
-                     * then follow the next remaining session if any */
-                    g.reconnPending = false;
-                    KillTimer(g.hwnd, TIMER_RECONN);
-                    close_scrcpy_and_wait();
-                    err_drain(true);
-                    if (g.hProc) {
-                        CloseHandle(g.hProc);
-                        g.hProc = NULL;
-                    }
-                    g.procGen = ++g_genSeq;
-                    g.pid = 0;
-                    g.target = NULL;
-                    hooks_remove();
-                    KillTimer(g.hwnd, TIMER_HUNT);
-                    int a = g_active;
-                    g_active = -1;
-                    if (a >= 0) {
-                        g_ses[a].hProc = NULL; /* closed above */
-                        g_ses[a].hErr = NULL;  /* drained by teardown path */
-                        ses_free(a);
-                    }
-                    g.launched = false;
-                    int next = ses_first_used();
-                    if (next >= 0) {
-                        ses_become_active(next);
-                    }
-                } else {
-                    /* background session: close its window; the exit is
-                     * cleaned up by WM_APP_SESEXIT */
-                    struct Session *s = &g_ses[idx];
-                    if (s->target && IsWindow(s->target)) {
-                        PostMessageW(s->target, WM_CLOSE, 0, 0);
-                    } else if (s->hProc) {
-                        TerminateProcess(s->hProc, 1);
-                    }
-                }
-                wcscpy(g.tipStatus, L"已断开会话");
                 mgr_refresh();
                 InvalidateRect(g.hwnd, NULL, FALSE);
             }
@@ -4303,6 +4281,7 @@ static bool send_scrcpy_shortcut(WORD vk)
  * the keys would be forwarded to the device as typed characters). */
 static bool use_shortcut_controls(void)
 {
+    if (g.attached) return false;
     if (g.cfg.control == 1) {
         return true;
     }
@@ -4326,6 +4305,11 @@ static void button_fire(int id)
     }
     if (id == ID_MGR) {
         mgr_toggle();
+        return;
+    }
+    if (g.attached) {
+        wcscpy(g.tipStatus, L"附着会话的设备未确认，请在管理窗口选择设备并连接");
+        mgr_open();
         return;
     }
     if (!g.adbOk && !use_shortcut_controls()) {
@@ -4429,6 +4413,118 @@ static void reconn_arm(void)
     SetTimer(g.hwnd, TIMER_RECONN, 1500, NULL);
 }
 
+/* A selected device without a session is not a request to close another one. */
+static bool ses_disconnect_selected(const wchar_t *serial)
+{
+    int idx = serial ? ses_find(serial) : g_active;
+    if (serial && idx < 0) {
+        wcscpy(g.tipStatus, L"所选设备没有投屏会话");
+        return false;
+    }
+    if (idx < 0 || idx == g_active) {
+        g.reconnPending = false;
+        KillTimer(g.hwnd, TIMER_RECONN);
+        close_scrcpy_and_wait();
+        err_drain(true);
+        if (g.hProc) {
+            CloseHandle(g.hProc);
+            g.hProc = NULL;
+        }
+        g.procGen = ++g_genSeq;
+        g.pid = 0;
+        g.target = NULL;
+        hooks_remove();
+        KillTimer(g.hwnd, TIMER_HUNT);
+        int a = g_active;
+        g_active = -1;
+        if (a >= 0) {
+            g_ses[a].hProc = NULL;
+            g_ses[a].hErr = NULL;
+            ses_free(a);
+        }
+        g.launched = false;
+        g.attached = false;
+        int next = ses_first_used();
+        if (next >= 0) ses_become_active(next);
+    } else {
+        struct Session *s = &g_ses[idx];
+        s->stopRequested = true;
+        s->reconnPending = false;
+        if (!s->hProc) {
+            ses_free(idx); /* cancel an offline session's pending retry */
+        } else if (s->target && IsWindow(s->target)) {
+            PostMessageW(s->target, WM_CLOSE, 0, 0);
+        } else {
+            TerminateProcess(s->hProc, 1);
+        }
+    }
+    return true;
+}
+
+static bool reconnect_device(wchar_t *serial, size_t cch)
+{
+    if (dev_online(serial)) return true;
+    const wchar_t *wifi = wifi_serial_in_list(serial);
+    if (wifi) {
+        wcsncpy_s(serial, cch, wifi, _TRUNCATE);
+        return dev_online(serial);
+    }
+    if (wcschr(serial, L':')) {
+        adb_spawn(L" connect %s", serial);
+    } else {
+        const wchar_t *ip = wifi_ip_of(serial);
+        if (ip) adb_spawn(L" connect %s:5555", ip);
+    }
+    return false;
+}
+
+static void ses_background_exit(int idx, DWORD code)
+{
+    if (g.closing || idx < 0 || idx >= SES_MAX || idx == g_active
+            || !g_ses[idx].used) return;
+    struct Session *s = &g_ses[idx];
+    if (s->hErr) {
+        CloseHandle(s->hErr);
+        s->hErr = NULL;
+    }
+    s->target = NULL;
+    if (code == 2 && GetTickCount64() - s->launchTick > 10000) {
+        s->reconnAttempts = 0;
+    }
+    if (code == 2 && !s->stopRequested && g.cfg.auto_reconnect
+            && s->reconnAttempts < g.cfg.reconnect_attempts) {
+        s->reconnPending = true;
+        SetTimer(g.hwnd, TIMER_BG_RECONN, 1500, NULL);
+        swprintf(g.tipStatus, TIP_STATUS_LEN, L"后台设备断开，等待重连: %s", s->serial);
+    } else {
+        swprintf(g.tipStatus, TIP_STATUS_LEN, L"会话已结束: %s", s->serial);
+        ses_free(idx);
+    }
+    mgr_refresh();
+}
+
+static void ses_reconnect_background(void)
+{
+    bool pending = false;
+    for (int i = 0; i < SES_MAX; i++) {
+        struct Session *s = &g_ses[i];
+        if (i == g_active || !s->used || !s->reconnPending || s->hProc) continue;
+        if (s->stopRequested || !g.cfg.auto_reconnect
+                || s->reconnAttempts >= g.cfg.reconnect_attempts) {
+            s->reconnPending = false;
+            continue;
+        }
+        s->reconnAttempts++;
+        if (reconnect_device(s->serial, 64)) {
+            /* Launch in the same slot without taking focus from the active device. */
+            launch_scrcpy_ex(s->serial, false);
+        }
+        if (s->reconnPending) pending = true;
+    }
+    if (!pending) KillTimer(g.hwnd, TIMER_BG_RECONN);
+    mgr_refresh();
+}
+
 /* Promote a background session to be the toolbar-controlled one: swap the
  * fields between g.* and the previous active slot, re-target the hooks and
  * start hunting for this session's SDL window. */
@@ -4436,6 +4532,12 @@ static void ses_become_active(int idx)
 {
     struct Session *s;
     if (idx < 0 || idx >= SES_MAX || !g_ses[idx].used || idx == g_active) {
+        return;
+    }
+    s = &g_ses[idx];
+    if (!s->hProc && !s->reconnPending) {
+        /* Keep the current session intact if a manual relaunch fails. */
+        launch_scrcpy_ex(s->serial, true);
         return;
     }
     /* demote the current active session back into its slot */
@@ -4452,18 +4554,11 @@ static void ses_become_active(int idx)
         cur->pinned_mod = g.pinned_mod;
         wcsncpy(cur->serial, g.serial, 63);
         cur->serial[63] = L'\0';
+        if (cur->reconnPending && !cur->hProc) {
+            SetTimer(g.hwnd, TIMER_BG_RECONN, 1500, NULL);
+        }
     }
     s = &g_ses[idx];
-    if (!s->hProc) {
-        /* background session already exited: relaunch instead of adopting a
-         * dead handle (which would leave g.pid stale and hooks_install
-         * hooking an exited PID). Save serial first: ses_free zeroes it. */
-        wchar_t dead_serial[64];
-        wcsncpy_s(dead_serial, 64, s->serial, _TRUNCATE);
-        ses_free(idx);
-        launch_scrcpy_ex(dead_serial, true);
-        return;
-    }
     g.hProc = s->hProc;
     g.hErr = s->hErr;
     g.pid = s->pid;
@@ -4478,14 +4573,20 @@ static void ses_become_active(int idx)
     wcsncpy(g.serial, s->serial, 127);
     g.serial[127] = L'\0';
     g.launched = true;
+    g.attached = false;
     s->hProc = NULL;
     s->hErr = NULL;
     g_active = idx;
     g.target = NULL;
     KillTimer(g.hwnd, TIMER_RECONN);
-    hooks_install(g.pid);
-    hunting_start();
-    if (g.reconnPending && !g.hProc && dev_online(g.serial)) {
+    if (g.hProc) {
+        hooks_install(g.pid);
+        hunting_start();
+    } else {
+        hooks_remove();
+        KillTimer(g.hwnd, TIMER_HUNT);
+    }
+    if (g.reconnPending && !g.hProc) {
         reconn_arm(); /* resume a pending reconnect of this session */
     }
     mgr_refresh();
@@ -4510,7 +4611,7 @@ static void devlist_apply(struct DevList *dl)
 
     /* Active/reconnecting sessions keep their identity across disconnects.
      * Only an idle auto-mode toolbar selects the unique online device. */
-    if (!g.cfg.serial[0] && g_active < 0 && !g.reconnPending
+    if (!g.attached && !g.cfg.serial[0] && g_active < 0 && !g.reconnPending
             && !g.launched && !dev_online(g.serial)) {
         int i;
         g.serial[0] = L'\0';
@@ -4560,6 +4661,7 @@ static void teardown(HWND hwnd)
     KillTimer(hwnd, TIMER_FLASH);
     KillTimer(hwnd, TIMER_TIP);
     KillTimer(hwnd, TIMER_RECONN);
+    KillTimer(hwnd, TIMER_BG_RECONN);
     if (g.hTrack) {
         track_stop(); /* a poller stuck inside adb is cut by process exit */
     }
@@ -4808,23 +4910,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 break;
             }
             g.reconnAttempts++;
-            if (!dev_online(g.serial)) {
-                /* keep trying to bring a WiFi device back (cheap, idempotent);
-                 * DEVLIST re-arms immediately once it appears */
-                if (wcschr(g.serial, L':')) {
-                    adb_spawn(L" connect %s", g.serial);
-                } else {
-                    const wchar_t *wf = wifi_serial_in_list(g.serial);
-                    if (wf) {
-                        wcsncpy(g.serial, wf, 127);
-                        g.serial[127] = L'\0';
-                    } else {
-                        const wchar_t *ip = wifi_ip_of(g.serial);
-                        if (ip) {
-                            adb_spawn(L" connect %s:5555", ip);
-                        }
-                    }
-                }
+            if (!reconnect_device(g.serial, 128)) {
                 reconn_arm(); /* next tick publishes budget exhaustion */
                 break;
             }
@@ -4840,6 +4926,9 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
             mgr_refresh();
             InvalidateRect(hwnd, NULL, FALSE);
+            break;
+        case TIMER_BG_RECONN:
+            ses_reconnect_background();
             break;
         default:
             break;
@@ -5010,15 +5099,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_APP_SESEXIT:
-        {
-            int idx = (int) wp;
-            if (idx >= 0 && idx < SES_MAX && g_ses[idx].used) {
-                swprintf(g.tipStatus, TIP_STATUS_LEN, L"会话已结束: %s",
-                         g_ses[idx].serial);
-                ses_free(idx);
-                mgr_refresh();
-            }
-        }
+        ses_background_exit((int) wp, (DWORD) lp);
         return 0;
 
     case WM_APP_SHOTDONE:
@@ -5090,7 +5171,8 @@ static int run_loop(void)
                 CloseHandle(s->hProc);
                 s->hProc = NULL;
                 if (g.hwnd) {
-                    SendMessageW(g.hwnd, WM_APP_SESEXIT, (WPARAM) idx, 0);
+                    SendMessageW(g.hwnd, WM_APP_SESEXIT, (WPARAM) idx,
+                                 (LPARAM) code);
                 }
             }
             continue;
@@ -5209,6 +5291,8 @@ int WINAPI wWinMain(HINSTANCE h_inst, HINSTANCE h_prev, PWSTR cmd_line,
     g.pid = find_scrcpy_pid();
     if (g.pid) {
         /* Attach to the running instance; keep it alive on toolbar close. */
+        g.attached = true;
+        g.serial[0] = L'\0'; /* saved preferences do not identify this PID */
         g.hProc = OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE
                               | PROCESS_QUERY_LIMITED_INFORMATION,
                               FALSE, g.pid);

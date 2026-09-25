@@ -11,8 +11,10 @@
    - **快捷键通道（默认，即时）**：向 scrcpy 窗口投递 `WM_SYSKEYDOWN`
      （MOD=lalt + H/B/S/P/↑/↓/N），scrcpy 经自己的控制 socket 注入，
      延迟约一帧；拉起时自动加 `--shortcut-mod=lalt` 固定 MOD
-   - **adb 通道（回退/附着模式）**：`adb shell input keyevent`
+   - **adb 通道（回退）**：`adb shell input keyevent`
      （`input` 每次冷启 Java，USB 下有 300ms+ 延迟，故仅作回退）
+   - **附着模式**：外部 scrcpy 的设备身份尚未确认时暂停设备控制；请在管理窗口
+     选择设备并连接，由工具栏创建绑定明确序列号的会话后恢复控制
 
 | 按钮 | 功能 | 快捷键 | keycode |
 |---|---|---|---|
@@ -144,6 +146,9 @@ build.bat D:\path\to\scrcpy\dist   :: 编译并复制到 scrcpy 目录
 
 零外部依赖：只链 user32/gdi32/kernel32/shell32/advapi32/comctl32/comdlg32。
 
+运行会话回归测试：`powershell -ExecutionPolicy Bypass -File tests\run.ps1`。
+测试直接调用生产状态机，模拟进程创建、窗口消息及定时器，不启动真实 ADB 或投屏。
+
 ## 图标与资源
 
 `scrdock.ico`（16~256 共 7 个尺寸）经 `scrdock.rc` 内嵌进 exe（含 VERSIONINFO 1.0.0.0），
@@ -152,13 +157,13 @@ build.bat D:\path\to\scrcpy\dist   :: 编译并复制到 scrcpy 目录
 
 ## 已知限制
 
-- 附着模式下默认走 adb 通道（外部实例的 --shortcut-mod 未知，投 Alt+X
-  会被当作普通按键转发到设备）；确知 MOD=lalt 时可设 `control=shortcut`
+- 附着外部实例时不会把已记住的设备视为该窗口的设备；确认设备并由工具栏
+  启动会话前，ADB 控制、截图及强制快捷键控制均暂停
 - 电源键（26）是真实电源键：会灭屏（镜像继续）
 - 单实例多会话：最多 4 路投屏同时运行，一个工具栏控制活动会话
 - ini 值为 ANSI；截图目录固定在 `Pictures\scrdock`
 - 同一时间只允许一个 scrdock 实例（互斥体）
 - 检测到多个 scrcpy.exe 时附着最新的那个；多设备时用管理窗口选择
   （拉起的 scrcpy 总是带 `-s <序列号>`，绝不连错设备）
-- 后台（非活动）会话断线不自动重连；切换为活动会话后恢复重连
-
+- 后台会话与活动会话均支持有次数限制的断线重连；后台重连不切换活动设备，
+  手动断开会取消该会话的重连
