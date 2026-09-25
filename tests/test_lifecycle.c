@@ -8,6 +8,62 @@ static ULONGLONG click_deadline;
 static wchar_t expected_click_result[128];
 static unsigned list_writes, list_deletes, list_inserts;
 
+static bool edit_is_centered(HWND edit, int height)
+{
+    RECT outer, client;
+    POINT origin = {0, 0};
+    GetWindowRect(edit, &outer);
+    GetClientRect(edit, &client);
+    ClientToScreen(edit, &origin);
+    LONG_PTR style = GetWindowLongPtrW(edit, GWL_STYLE);
+    int above = origin.y - outer.top;
+    int below = outer.bottom - origin.y - client.bottom;
+    if (!(style & ES_CENTER) || (style & ES_MULTILINE)
+            || outer.bottom - outer.top != height || abs(above - below) > 1) return false;
+    HDC dc = GetDC(edit);
+    HFONT font = (HFONT) SendMessageW(edit, WM_GETFONT, 0, 0);
+    HGDIOBJ old = SelectObject(dc, font);
+    TEXTMETRICW tm;
+    GetTextMetricsW(dc, &tm);
+    SelectObject(dc, old);
+    ReleaseDC(edit, dc);
+    return client.bottom == tm.tmHeight;
+}
+
+static int run_edit_layout(void)
+{
+    g_hInst = GetModuleHandleW(NULL);
+    INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES};
+    InitCommonControlsEx(&icc);
+    register_and_create();
+    mgr_open();
+    HWND fields[] = {m.wifiEd, m.wifiPort, m.bitrate, m.maxsize, m.maxfps,
+                     m.reconnN, m.extra, m.scrcpyEd, m.adbEd};
+    RECT button;
+    GetWindowRect(m.wifiGo, &button);
+    for (int i = 0; i < (int)(sizeof(fields) / sizeof(fields[0])); i++) {
+        if (!edit_is_centered(fields[i], button.bottom - button.top)) return 40 + i;
+    }
+    HFONT saved = m.font;
+    for (UINT dpi = 96; dpi <= 192; dpi += 48) {
+        m.font = mgr_font_make(false, dpi);
+        HWND edit = mgr_edit(g.hwnd, dpi, L"5555", 0, 0, 100, ES_NUMBER, 950);
+        if (!edit_is_centered(edit, MulDiv(MG_BTN_H_96, dpi, 96))) return 50;
+        SetWindowTextW(edit, L"");
+        SetFocus(edit);
+        SendMessageW(edit, WM_CHAR, L'6', 1);
+        for (int i = 0; i < 3; i++) SendMessageW(edit, WM_CHAR, L'0', 1);
+        wchar_t text[16];
+        GetWindowTextW(edit, text, 16);
+        if (wcscmp(text, L"6000")) return 51;
+        DestroyWindow(edit);
+        DeleteObject(m.font);
+    }
+    m.font = saved;
+    PostMessageW(g.hwnd, WM_CLOSE, 0, 0);
+    return run_loop();
+}
+
 static LRESULT CALLBACK count_list_updates(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
                                            UINT_PTR id, DWORD_PTR data)
 {
@@ -183,6 +239,7 @@ static VOID CALLBACK check_window_state(HWND hwnd, UINT msg, UINT_PTR id, DWORD 
 
 static int run_case(const wchar_t *mode)
 {
+    if (wcscmp(mode, L"edit-layout") == 0) return run_edit_layout();
     if (wcscmp(mode, L"list-refresh") == 0) return run_list_refresh();
     if (wcsncmp(mode, L"wireless-", 9) == 0) return run_wireless_click(mode);
     test_mode = mode;
@@ -246,7 +303,7 @@ int wmain(int argc, wchar_t **argv)
     if (!GetModuleFileNameW(NULL, exe, MAX_PATH)) return 1;
     const wchar_t *cases[] = {L"empty", L"pending", L"lost", L"docked",
                              L"activate-existing", L"activate-new", L"wireless-click",
-                             L"wireless-default", L"wireless-custom", L"list-refresh"};
+                             L"wireless-default", L"wireless-custom", L"list-refresh", L"edit-layout"};
     int failures = 0;
     for (int i = 0; i < (int) (sizeof(cases) / sizeof(cases[0])); i++) {
         wchar_t cmd[MAX_PATH + 64];

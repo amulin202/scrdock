@@ -2257,10 +2257,66 @@ static HFONT mgr_font_make(bool bold, UINT dpi)
 
 #define ISCHK(h) ((h) && SendMessageW((h), BM_GETCHECK, 0, 0) == BST_CHECKED)
 
+/* Single-line EDIT ignores EM_SETRECT; center its native client area instead. */
+static LRESULT CALLBACK centered_edit_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
+                                           UINT_PTR id, DWORD_PTR data)
+{
+    (void) data;
+    if (msg == WM_NCCALCSIZE) {
+        LRESULT result = DefSubclassProc(hwnd, msg, wp, lp);
+        RECT *r = wp ? &((NCCALCSIZE_PARAMS *) lp)->rgrc[0] : (RECT *) lp;
+        HDC dc = GetDC(hwnd);
+        if (!dc) return result;
+        HFONT font = (HFONT) SendMessageW(hwnd, WM_GETFONT, 0, 0);
+        HGDIOBJ previous = font ? SelectObject(dc, font) : NULL;
+        TEXTMETRICW tm;
+        if (GetTextMetricsW(dc, &tm)) {
+            int spare = (r->bottom - r->top) - tm.tmHeight;
+            if (spare > 0) {
+                r->top += spare / 2;
+                r->bottom -= spare - spare / 2;
+            }
+        }
+        if (previous) SelectObject(dc, previous);
+        ReleaseDC(hwnd, dc);
+        return result;
+    }
+    if (msg == WM_NCPAINT) {
+        HDC dc = GetWindowDC(hwnd);
+        if (!dc) return 0;
+        RECT outer, client;
+        POINT origin = {0, 0};
+        GetWindowRect(hwnd, &outer);
+        GetClientRect(hwnd, &client);
+        ClientToScreen(hwnd, &origin);
+        OffsetRect(&client, origin.x - outer.left, origin.y - outer.top);
+        OffsetRect(&outer, -outer.left, -outer.top);
+        ExcludeClipRect(dc, client.left, client.top, client.right, client.bottom);
+        HBRUSH brush = CreateSolidBrush(RGB(43, 43, 43));
+        FillRect(dc, &outer, brush);
+        DeleteObject(brush);
+        ReleaseDC(hwnd, dc);
+        return 0;
+    }
+    if (msg == WM_SETFONT) {
+        LRESULT result = DefSubclassProc(hwnd, msg, wp, lp);
+        SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        return result;
+    }
+    if (msg == WM_NCDESTROY) RemoveWindowSubclass(hwnd, centered_edit_proc, id);
+    return DefSubclassProc(hwnd, msg, wp, lp);
+}
+
 static HWND mkctl(HWND parent, const wchar_t *cls, DWORD style,
                   const wchar_t *text, int x, int y, int w, int h,
                   int id, UINT dpi)
 {
+    bool centered = wcscmp(cls, L"EDIT") == 0 && !(style & (ES_MULTILINE | ES_READONLY));
+    if (centered) {
+        style = (style & ~(DWORD) (ES_CENTER | ES_RIGHT)) | ES_CENTER;
+        h = MG_BTN_H_96;
+    }
     /* push buttons become owner-drawn (dark theme); checkboxes stay native */
     if (wcscmp(cls, L"BUTTON") == 0 && !(style & BS_AUTOCHECKBOX)) {
         style |= BS_OWNERDRAW;
@@ -2271,6 +2327,7 @@ static HWND mkctl(HWND parent, const wchar_t *cls, DWORD style,
                                MulDiv(w, dpi, 96), MulDiv(h, dpi, 96),
                                parent, (HMENU) (INT_PTR) id, g_hInst, NULL);
     if (ctl) {
+        if (centered) SetWindowSubclass(ctl, centered_edit_proc, 1, 0);
         SendMessageW(ctl, WM_SETFONT,
                      (WPARAM) (m.font ? m.font : g.fUi), TRUE);
     }
@@ -2924,11 +2981,10 @@ static void mgr_create_opt_page(HWND page, UINT dpi)
     mgr_label(page, dpi, L"附加参数（追加到命令行末尾，可覆盖以上选项）:",
               0, y, 560);
     y += MG_ROW_H_96 + 6;
-    m.extra = mkctl(page, L"EDIT",
-                    ES_MULTILINE | ES_AUTOHSCROLL | WS_TABSTOP,
-                    g.cfg.scrcpy_args, 0, y, 560, 56, MID_EXTRA, dpi);
+    m.extra = mkctl(page, L"EDIT", ES_AUTOHSCROLL | WS_TABSTOP,
+                    g.cfg.scrcpy_args, 0, y, 560, MG_BTN_H_96, MID_EXTRA, dpi);
 
-    y += 56 + 14;
+    y += MG_BTN_H_96 + 14;
     m.optSave = mgr_button(page, dpi, L"保存", 0, y, 110, MID_OPT_SAVE);
     y += MG_BTN_H_96 + 8;
     mkctl(page, L"STATIC", SS_NOPREFIX | SS_CENTERIMAGE,
@@ -3004,6 +3060,7 @@ struct MdnsItem {
     char name[128];
     char type[80];
     wchar_t addr[80];
+    bool quoted_name;
 };
 
 /* Parse "adb mdns services" output robustly from right to left:
@@ -3046,6 +3103,15 @@ static int mdns_parse_items(const char *buf, struct MdnsItem *items, int max)
         while (del2 > line && (*del2 == ' ' || *del2 == '\t')) del2--;
         *(del2 + 1) = '\0';
         char *name = line;
+        /* Android QR pairing may advertise a quoted SSID/service name.
+         * Normalize presentation quotes before matching the QR's service. */
+        size_t name_len = strlen(name);
+        bool quoted_name = name_len >= 2 && name[0] == '"' && name[name_len - 1] == '"';
+        if (name_len >= 2 && (name[0] == '"' || name[0] == '\'')
+                && name[name_len - 1] == name[0]) {
+            name[name_len - 1] = '\0';
+            name++;
+        }
 
         /* Validate endpoint */
         size_t elen = strlen(endpoint);
@@ -3062,6 +3128,7 @@ static int mdns_parse_items(const char *buf, struct MdnsItem *items, int max)
         strncpy_s(items[count].name, sizeof(items[count].name), name, _TRUNCATE);
         strncpy_s(items[count].type, sizeof(items[count].type), type, _TRUNCATE);
         wcscpy_s(items[count].addr, 80, waddr);
+        items[count].quoted_name = quoted_name;
         count++;
     }
     free(dup);
@@ -3102,8 +3169,8 @@ static int mdns_parse_pairing(const char *buf, wchar_t addrs[][80], int max)
     return n;
 }
 
-static bool mdns_find_pairing_target(const char *buf, const char *service_name,
-                                     wchar_t *out_addr, size_t out_max)
+static bool mdns_find_pairing_target_ex(const char *buf, const char *service_name,
+                                        wchar_t *out_addr, size_t out_max, bool *quoted)
 {
     struct MdnsItem items[16];
     int total = mdns_parse_items(buf, items, 16);
@@ -3113,11 +3180,14 @@ static bool mdns_find_pairing_target(const char *buf, const char *service_name,
         size_t slen = strlen(service_name);
         for (int i = 0; i < total; i++) {
             if (strncmp(items[i].type, "_adb-tls-pairing", 16) == 0) {
-                if (strncmp(items[i].name, service_name, slen) == 0
+                if (_strnicmp(items[i].name, service_name, slen) == 0
                         && (items[i].name[slen] == '\0'
-                            || strcmp(items[i].name + slen, "._adb-tls-pairing._tcp.") == 0
-                            || strcmp(items[i].name + slen, "._adb-tls-pairing._tcp") == 0)) {
+                            || _stricmp(items[i].name + slen, "._adb-tls-pairing._tcp.") == 0
+                            || _stricmp(items[i].name + slen, "._adb-tls-pairing._tcp") == 0
+                            || _stricmp(items[i].name + slen, "._adb-tls-pairing._tcp.local.") == 0
+                            || _stricmp(items[i].name + slen, "._adb-tls-pairing._tcp.local") == 0)) {
                     wcsncpy_s(out_addr, out_max, items[i].addr, _TRUNCATE);
+                    if (quoted) *quoted = items[i].quoted_name;
                     return true;
                 }
             }
@@ -3125,6 +3195,12 @@ static bool mdns_find_pairing_target(const char *buf, const char *service_name,
     }
 
     return false;
+}
+
+static bool mdns_find_pairing_target(const char *buf, const char *service_name,
+                                     wchar_t *out_addr, size_t out_max)
+{
+    return mdns_find_pairing_target_ex(buf, service_name, out_addr, out_max, NULL);
 }
 
 static bool mdns_same_host(const wchar_t *a, const wchar_t *b)
@@ -3416,6 +3492,10 @@ static void qr_stop(void)
     MSG msg;
     while (p.frame && PeekMessageW(&msg, p.frame, WM_APP_QREVENT,
                                    WM_APP_QREVENT, PM_REMOVE)) {
+        if (msg.message == WM_QUIT) {
+            PostQuitMessage((int) msg.wParam);
+            break;
+        }
         free((void *)msg.lParam);
     }
 }
@@ -3441,21 +3521,28 @@ static unsigned __stdcall qr_pair_thread(void *arg)
 
     wchar_t cmd[MAX_PATH + 32];
     char buf[4096];
+    DWORD check_code = 1;
+    swprintf(cmd, MAX_PATH + 32, L"\"%s\" mdns check", w->adb);
+    if (!capture_sync_cancel(cmd, buf, sizeof(buf), 6000, &check_code, w->stop)
+            || check_code != 0) {
+        qr_post_event(w, QREV_FAILED, L"ADB mDNS 不可用，请更新 platform-tools 并检查局域网通信");
+        goto done;
+    }
     swprintf(cmd, MAX_PATH + 32, L"\"%s\" mdns services", w->adb);
 
     wchar_t pair_addr[80] = { 0 };
+    bool quoted_credentials = false;
 
-    /* 轮询至多 60 秒等待手机扫码发起的 _adb-tls-pairing 广播 */
-    ULONGLONG deadline = GetTickCount64() + 60000;
-    while (GetTickCount64() < deadline) {
+    /* Keep discovery alive for as long as this QR code is displayed. A fixed
+     * timeout left a scannable-looking but inactive code on screen. */
+    for (;;) {
         if (WaitForSingleObject(w->stop, 0) == WAIT_OBJECT_0) {
             goto done;
         }
         DWORD ec = 1;
-        DWORD remaining = (DWORD)(deadline - GetTickCount64());
-        if (capture_sync_cancel(cmd, buf, sizeof(buf), remaining < 6000 ? remaining : 6000,
+        if (capture_sync_cancel(cmd, buf, sizeof(buf), 6000,
                                 &ec, w->stop) && ec == 0) {
-            if (mdns_find_pairing_target(buf, service, pair_addr, 80)) {
+            if (mdns_find_pairing_target_ex(buf, service, pair_addr, 80, &quoted_credentials)) {
                 break;
             }
         }
@@ -3479,7 +3566,11 @@ static unsigned __stdcall qr_pair_thread(void *arg)
     wchar_t pair_cmd[MAX_PATH + 160];
     char out[512] = { 0 };
     DWORD ec = 1;
-    swprintf(pair_cmd, MAX_PATH + 160, L"\"%s\" pair %s %s", w->adb, pair_addr, code);
+    /* Some vendor QR parsers wrap both SSID and PSK in literal quotes.
+     * Windows command-line quoting must preserve those characters in argv. */
+    swprintf(pair_cmd, MAX_PATH + 160,
+             quoted_credentials ? L"\"%s\" pair %s \\\"%s\\\"" : L"\"%s\" pair %s %s",
+             w->adb, pair_addr, code);
     if (!capture_sync_cancel(pair_cmd, out, sizeof(out), 15000, &ec, w->stop)) {
         qr_post_event(w, QREV_FAILED, L"执行配对指令超时");
         goto done;
@@ -3565,6 +3656,18 @@ done:
     return 0;
 }
 
+static bool qr_encode_credentials(const char *service, const char *code)
+{
+    char payload[128];
+    int length = snprintf(payload, sizeof(payload), "WIFI:T:ADB;S:%s;P:%s;;", service, code);
+    uint8_t temp[qrcodegen_BUFFER_LEN_FOR_VERSION(6)];
+    bool ok = length > 0 && length < (int) sizeof(payload)
+        && qrcodegen_encodeText(payload, temp, p.qrData, qrcodegen_Ecc_LOW,
+                               qrcodegen_VERSION_MIN, 6, qrcodegen_Mask_AUTO, true);
+    p.qrSize = ok ? qrcodegen_getSize(p.qrData) : 0;
+    return ok;
+}
+
 static void qr_generate(void)
 {
     qr_stop();
@@ -3593,18 +3696,7 @@ static void qr_generate(void)
     MultiByteToWideChar(CP_UTF8, 0, code_a, -1, p.qrCode, 16);
     MultiByteToWideChar(CP_UTF8, 0, serv_a, -1, p.qrService, 32);
 
-    char payload[128];
-    snprintf(payload, sizeof(payload), "WIFI:T:ADB;S:%s;P:%s;;", serv_a, code_a);
-
-    uint8_t tempBuffer[qrcodegen_BUFFER_LEN_FOR_VERSION(6)];
-    bool ok = qrcodegen_encodeText(payload, tempBuffer, p.qrData,
-                                   qrcodegen_Ecc_LOW,
-                                   qrcodegen_VERSION_MIN, 6,
-                                   qrcodegen_Mask_AUTO, true);
-    if (ok) {
-        p.qrSize = qrcodegen_getSize(p.qrData);
-    } else {
-        p.qrSize = 0;
+    if (!qr_encode_credentials(serv_a, code_a)) {
         SetWindowTextW(p.qrStatus, L"生成二维码失败，请重试");
         InvalidateRect(p.frame, NULL, FALSE);
         return;
@@ -3612,7 +3704,7 @@ static void qr_generate(void)
 
     if (p.qrStatus && IsWindow(p.qrStatus)) {
         wchar_t tip[160];
-        swprintf(tip, 160, L"等待扫码… 配对码: %s\n请用手机【无线调试】扫描上方二维码", p.qrCode);
+        wcscpy_s(tip, 160, L"等待扫码：二维码在此窗口打开期间持续有效\n请用手机【无线调试 → 使用二维码配对设备】扫码");
         SetWindowTextW(p.qrStatus, tip);
     }
 
@@ -3976,8 +4068,8 @@ static void pair_open(HWND owner)
     p.qrRefresh = mkctl(f, L"BUTTON", WS_TABSTOP,
                         L"重新生成二维码", 145, 348, 150, MG_BTN_H_96, MID_PAIR_QR_REFRESH, dpi);
     p.qrTip = mkctl(f, L"STATIC", SS_NOPREFIX | SS_CENTER,
-                    L"手机与电脑需连接至同一 Wi-Fi 网络。\n扫码后将自动完成配对与连接。",
-                    16, 396, 408, 40, 0, dpi);
+                    L"支持 Android 11 及以上（含 Android 15）。\n请使用无线调试扫码，勿用相机或微信。\n手机与电脑需在同一局域网。",
+                    16, 390, 408, 60, 0, dpi);
 
     /* 手动配对控件 */
     p.lblAddr = mkctl(f, L"STATIC", SS_NOPREFIX | SS_CENTERIMAGE,
