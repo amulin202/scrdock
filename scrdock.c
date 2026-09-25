@@ -50,6 +50,8 @@
 #include <wchar.h>
 #include <commctrl.h>
 #include <commdlg.h>
+#include <wincrypt.h>
+#include "qrcodegen.h"
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "comdlg32.lib")
@@ -61,6 +63,7 @@
 #define WM_APP_DETECTED (WM_APP + 5)  /* wp: heap wchar[] text         */
 #define WM_APP_WIFIDONE (WM_APP + 6)  /* wp: heap WifiResult*          */
 #define WM_APP_SESEXIT  (WM_APP + 7)  /* wp: session index             */
+#define WM_APP_QREVENT  (WM_APP + 8)  /* lp: owned struct QrEvent* */
 
 #define TIMER_HUNT  1  /* 200 ms: poll for the scrcpy window            */
 #define TIMER_SYNC  2  /* 500 ms: safety net (missed events, pid polls) */
@@ -135,6 +138,7 @@ struct DevMeta {
 struct DevMetaBatch {
     int count;
     int scrW, scrH;          /* wm size of the selected device (0 = skip) */
+    wchar_t selected[64];
     struct DevMeta v[DEV_MAX];
 };
 
@@ -156,6 +160,8 @@ struct Config {
     int reconnect_attempts;
     BOOL wireless;           /* launch with --tcpip (USB -> WiFi switch) */
 };
+
+#define TIP_STATUS_LEN (MAX_PATH + 32)
 
 struct Scrdock {
     HWND hwnd;              /* toolbar window                       */
@@ -180,7 +186,6 @@ struct Scrdock {
     bool adbOk;
     bool glyphsOk;
     bool devNone;
-    bool notifFallback;
     bool pinned;             /* window always-on-top toggle       */
     int scrW, scrH;         /* device screen size for swipe fallback */
     int tipShownFor;        /* button index whose tooltip is visible  */
@@ -206,7 +211,7 @@ struct Scrdock {
     wchar_t scrcpyPath[MAX_PATH];
     wchar_t adbPath[MAX_PATH];
     wchar_t serial[128];
-    wchar_t tipStatus[MAX_PATH + 32];
+    wchar_t tipStatus[TIP_STATUS_LEN];
     RECT btnRc[ID_COUNT];
     int w, h;               /* window size (dpi-scaled)             */
     RECT lastDock;          /* dedupe                               */
@@ -238,6 +243,7 @@ struct Session {
     ULONGLONG launchTick;
     int reconnAttempts;
     bool reconnPending;
+    bool pinned_mod;
 };
 
 static struct Session g_ses[SES_MAX];
@@ -607,7 +613,7 @@ static void cmd_catf(wchar_t *out, size_t cch, int *n, const wchar_t *fmt, ...)
  * silently drift to another device, then the structured options, then the
  * raw scrcpy_args tail (scrcpy applies options in order, so the tail wins
  * and can override anything above). */
-static void build_scrcpy_cmd(wchar_t *cmd, size_t cch, const wchar_t *serial)
+static bool build_scrcpy_cmd(wchar_t *cmd, size_t cch, const wchar_t *serial)
 {
     int n = 0;
     cmd[0] = L'\0';
@@ -618,8 +624,8 @@ static void build_scrcpy_cmd(wchar_t *cmd, size_t cch, const wchar_t *serial)
     /* Pin MOD=Left-Alt so the toolbar can send instant MOD+key shortcuts to
      * the scrcpy window (see send_scrcpy_shortcut). Skipped if the user
      * already passes --shortcut-mod of their own. */
-    g.pinned_mod = (wcsstr(g.cfg.scrcpy_args, L"--shortcut-mod") == NULL);
-    if (g.pinned_mod) {
+    bool pinned_mod = (wcsstr(g.cfg.scrcpy_args, L"--shortcut-mod") == NULL);
+    if (pinned_mod) {
         cmd_catf(cmd, cch, &n, L" --shortcut-mod=lalt");
     }
     if (g.cfg.max_size > 0) {
@@ -650,6 +656,7 @@ static void build_scrcpy_cmd(wchar_t *cmd, size_t cch, const wchar_t *serial)
     if (g.cfg.scrcpy_args[0]) {
         cmd_catf(cmd, cch, &n, L" %s", g.cfg.scrcpy_args);
     }
+    return pinned_mod;
 }
 
 /* Launch a new scrcpy session for `serial`.
@@ -658,6 +665,9 @@ static void build_scrcpy_cmd(wchar_t *cmd, size_t cch, const wchar_t *serial)
  * background slot for that serial. */
 static bool launch_scrcpy_ex(const wchar_t *serial, bool activate)
 {
+    wchar_t selected[128];
+    wcsncpy_s(selected, 128, serial, _TRUNCATE);
+    serial = selected;
     wchar_t cmd[1400];
     wchar_t dir[MAX_PATH];
     struct Session *slot = NULL;
@@ -666,6 +676,15 @@ static bool launch_scrcpy_ex(const wchar_t *serial, bool activate)
     /* slot bookkeeping: one session per serial (resolved before touching
      * the active state below) */
     idx = ses_find(serial);
+    if (idx >= 0) {
+        HANDLE existing = idx == g_active ? g.hProc : g_ses[idx].hProc;
+        if (existing) {
+            if (activate && idx != g_active) {
+                ses_become_active(idx);
+            }
+            return true; /* an exit event retires a dead handle before retry */
+        }
+    }
     if (idx < 0) {
         idx = ses_free_slot();
         if (idx < 0) {
@@ -685,12 +704,43 @@ static bool launch_scrcpy_ex(const wchar_t *serial, bool activate)
         slot->hProc = NULL;
     }
 
+    bool pinned_mod = build_scrcpy_cmd(cmd, 1400, serial);
+    dir_of(g.scrcpyPath, dir, MAX_PATH);
+
+    /* Commit the active-session switch only after CreateProcess succeeds. */
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = NULL;
+    sa.bInheritHandle = TRUE;
+    HANDLE rd = NULL, wr = NULL;
+    if (CreatePipe(&rd, &wr, &sa, 0)) {
+        SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+    } else {
+        rd = wr = NULL;
+    }
+    STARTUPINFOW si = {0};
+    PROCESS_INFORMATION pi = {0};
+    si.cb = sizeof(si);
+    if (wr) {
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdOutput = g.hNul;
+        si.hStdError = wr;
+    }
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, wr != NULL, CREATE_NO_WINDOW,
+                        NULL, dir[0] ? dir : NULL, &si, &pi)) {
+        DWORD error = GetLastError();
+        if (rd) CloseHandle(rd);
+        if (wr) CloseHandle(wr);
+        if (!slot->pid) ses_free(idx);
+        SetLastError(error);
+        return false;
+    }
+    CloseHandle(pi.hThread);
+    if (wr) CloseHandle(wr);
+
     if (activate) {
         KillTimer(g.hwnd, TIMER_RECONN);
-        g.reconnPending = false;
-        if (g.hErr) {
-            err_drain(true);
-        }
+        if (g.hErr) err_drain(g_active < 0 || g_active == idx);
         if (g_active >= 0 && g_active != idx) {
             /* the running active session moves to the background and keeps
              * running; its handles go back to its slot (waited by run_loop) */
@@ -702,7 +752,8 @@ static bool launch_scrcpy_ex(const wchar_t *serial, bool activate)
             cur->gen = g.procGen;
             cur->launchTick = g.launchTick;
             cur->reconnAttempts = g.reconnAttempts;
-            cur->reconnPending = false; /* paused while in the background */
+            cur->reconnPending = g.reconnPending;
+            cur->pinned_mod = g.pinned_mod;
             wcsncpy(cur->serial, g.serial, 63);
             cur->serial[63] = L'\0';
         } else if (g.hProc) {
@@ -712,80 +763,37 @@ static bool launch_scrcpy_ex(const wchar_t *serial, bool activate)
         }
         g.errBuf[0] = '\0';
         g.errLine[0] = L'\0';
+        g.reconnPending = false;
     }
 
-    build_scrcpy_cmd(cmd, 1400, serial);
-    dir_of(g.scrcpyPath, dir, MAX_PATH);
-
-    /* stderr -> pipe: launch failures become visible instead of vanishing
-     * into the void of CREATE_NO_WINDOW (e.g. "Multiple (2) ADB devices"). */
-    SECURITY_ATTRIBUTES sa;
-    sa.nLength = sizeof(sa);
-    sa.lpSecurityDescriptor = NULL;
-    sa.bInheritHandle = TRUE;
-    HANDLE rd = NULL, wr = NULL;
-    if (CreatePipe(&rd, &wr, &sa, 0)) {
-        SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
-    } else {
-        rd = wr = NULL;
-    }
-
-    STARTUPINFOW si;
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&si, sizeof(si));
-    ZeroMemory(&pi, sizeof(pi));
-    si.cb = sizeof(si);
-    if (wr) {
-        si.dwFlags = STARTF_USESTDHANDLES;
-        si.hStdOutput = g.hNul;
-        si.hStdError = wr;
-        si.hStdInput = NULL;
-    }
-
-    /* CREATE_NO_WINDOW: scrcpy.exe is a console app; never flash a console.
-     * Working directory = scrcpy dir so a portable dist finds scrcpy-server. */
-    if (!CreateProcessW(NULL, cmd, NULL, NULL, wr != NULL, CREATE_NO_WINDOW,
-                        NULL, dir[0] ? dir : NULL, &si, &pi)) {
-        dbg_log(L"launch_scrcpy: CreateProcessW failed (%lu)", GetLastError());
-        if (rd) {
-            CloseHandle(rd);
-        }
-        if (wr) {
-            CloseHandle(wr);
-        }
-        if (!g_ses[idx].pid) {
-            ses_free(idx); /* nothing ever ran on this fresh slot */
-        }
-        return false;
-    }
-    CloseHandle(pi.hThread);
-    if (wr) {
-        CloseHandle(wr); /* the child holds the only write end now */
-    }
     slot->pid = pi.dwProcessId;
     slot->launchTick = GetTickCount64();
     slot->gen = ++g_genSeq;
     slot->reconnAttempts = 0;
     slot->reconnPending = false;
+    slot->pinned_mod = pinned_mod;
 
     if (activate) {
         g.hErr = rd;
         g.hProc = pi.hProcess;
         g.pid = slot->pid;
         g.launched = true;
+        g.pinned_mod = pinned_mod;
+        g.scrW = g.scrH = 0;
         g.launchTick = slot->launchTick;
         g.procGen = slot->gen;
-        g.reconnAttempts = 0;
         g.reconnPending = false;
         wcsncpy(g.serial, serial, 127);
         g.serial[127] = L'\0';
         g_active = idx;
+        g.bootLaunch = false;
 
         /* a brand new process: re-target the window hooks and hunt for the
          * SDL window (the toolbar re-docks when it appears) */
         g.target = NULL;
         hooks_install(g.pid);
         hunting_start();
+        meta_spawn();
     } else {
         slot->hErr = rd;
         slot->hProc = pi.hProcess;
@@ -795,6 +803,10 @@ static bool launch_scrcpy_ex(const wchar_t *serial, bool activate)
 
 static bool launch_scrcpy(void)
 {
+    /* USB-to-WiFi reconnect changes the adb serial, not the session slot. */
+    if (g_active >= 0 && !g.hProc && g.reconnPending) {
+        wcsncpy_s(g_ses[g_active].serial, 64, g.serial, _TRUNCATE);
+    }
     return launch_scrcpy_ex(g.serial, true);
 }
 
@@ -843,14 +855,38 @@ static void close_scrcpy_and_wait(void)
 /* adb helpers                                                         */
 
 /* Build "<quoted adb>" [-s serial] + formatted tail into out. */
-static int adb_cmd_fmt(wchar_t *out, size_t cch, const wchar_t *tail_fmt, ...)
+struct AdbWork {
+    wchar_t adb[MAX_PATH];
+    wchar_t serial[128];
+    wchar_t path[MAX_PATH];
+    HWND hwnd;
+    int scrW, scrH;
+    bool settings;
+};
+
+static struct AdbWork *adb_work_new(void)
 {
-    int n = swprintf(out, cch, L"\"%s\"", g.adbPath);
+    if (!g.adbOk || !g.serial[0]) return NULL;
+    struct AdbWork *w = calloc(1, sizeof(*w));
+    if (w) {
+        wcscpy_s(w->adb, MAX_PATH, g.adbPath);
+        wcscpy_s(w->serial, 128, g.serial);
+        w->hwnd = g.hwnd;
+        w->scrW = g.scrW;
+        w->scrH = g.scrH;
+    }
+    return w;
+}
+
+static int adb_cmd_fmt(const struct AdbWork *w, wchar_t *out, size_t cch,
+                       const wchar_t *tail_fmt, ...)
+{
+    int n = swprintf(out, cch, L"\"%s\"", w->adb);
     if (n < 0) {
         return 0;
     }
-    if (g.serial[0]) {
-        int k = swprintf(out + n, cch - (size_t) n, L" -s %s", g.serial);
+    if (w->serial[0]) {
+        int k = swprintf(out + n, cch - (size_t) n, L" -s %s", w->serial);
         if (k < 0) {
             return n;
         }
@@ -911,8 +947,8 @@ static void adb_spawn(const wchar_t *tail_fmt, ...)
 
 /* Run a command to completion, capturing stdout into a temp file, then
  * reading it back. Worker threads only (it waits). */
-static bool capture_sync(const wchar_t *cmdline, char *out, DWORD cb_out,
-                         DWORD timeout_ms, DWORD *exit_code)
+static bool capture_sync_cancel(const wchar_t *cmdline, char *out, DWORD cb_out,
+                                DWORD timeout_ms, DWORD *exit_code, HANDLE stop)
 {
     wchar_t tmp_dir[MAX_PATH];
     wchar_t tmp_file[MAX_PATH];
@@ -920,6 +956,9 @@ static bool capture_sync(const wchar_t *cmdline, char *out, DWORD cb_out,
     HANDLE hf;
     DWORD n = GetTempPathW(MAX_PATH, tmp_dir);
     bool ok = false;
+    if (out && cb_out) out[0] = '\0';
+    if (exit_code) *exit_code = (DWORD)-1;
+    if (stop && WaitForSingleObject(stop, 0) == WAIT_OBJECT_0) return false;
 
     if (!n || n >= MAX_PATH) {
         return false;
@@ -944,12 +983,14 @@ static bool capture_sync(const wchar_t *cmdline, char *out, DWORD cb_out,
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdOutput = hf;
-    si.hStdError = g.hNul ? g.hNul : hf;
+    si.hStdError = hf;
     si.hStdInput = NULL;
 
     if (CreateProcessW(NULL, (LPWSTR) cmdline, NULL, NULL, TRUE,
                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        if (WaitForSingleObject(pi.hProcess, timeout_ms) == WAIT_OBJECT_0) {
+        HANDLE waits[2] = {pi.hProcess, stop};
+        if (WaitForMultipleObjects(stop ? 2 : 1, waits, FALSE, timeout_ms)
+                == WAIT_OBJECT_0) {
             DWORD ec = 0;
             GetExitCodeProcess(pi.hProcess, &ec);
             if (exit_code) {
@@ -958,6 +999,7 @@ static bool capture_sync(const wchar_t *cmdline, char *out, DWORD cb_out,
             ok = true;
         } else {
             TerminateProcess(pi.hProcess, 1);
+            WaitForSingleObject(pi.hProcess, INFINITE);
         }
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
@@ -977,6 +1019,12 @@ static bool capture_sync(const wchar_t *cmdline, char *out, DWORD cb_out,
     }
     DeleteFileW(tmp_file);
     return ok;
+}
+
+static bool capture_sync(const wchar_t *cmdline, char *out, DWORD cb_out,
+                         DWORD timeout_ms, DWORD *exit_code)
+{
+    return capture_sync_cancel(cmdline, out, cb_out, timeout_ms, exit_code, NULL);
 }
 
 /* Redirect the command's stdout straight into path (raw handle: no CRT
@@ -1154,6 +1202,25 @@ static void err_drain(bool final)
     }
 }
 
+/* Background children own stderr pipes too; discard their output regularly
+ * so a full pipe cannot stall a session the toolbar is not controlling. */
+static void ses_drain_background(void)
+{
+    for (int i = 0; i < SES_MAX; i++) {
+        HANDLE pipe = g_ses[i].hErr;
+        if (!pipe || i == g_active) continue;
+        DWORD available = 0;
+        char chunk[1024];
+        for (int reads = 0; reads < 64; reads++) {
+            if (!PeekNamedPipe(pipe, NULL, 0, NULL, &available, NULL)
+                    || !available) break;
+            DWORD read = 0;
+            DWORD want = available < sizeof(chunk) ? available : sizeof(chunk);
+            if (!ReadFile(pipe, chunk, want, &read, NULL) || !read) break;
+        }
+    }
+}
+
 /* Last "ERROR" line from scrcpy's stderr, else the buffer tail. */
 static void err_last_line(wchar_t *out, size_t cch)
 {
@@ -1202,7 +1269,8 @@ static void devlist_parse(const char *text, struct DevList *dl)
     while (line && dl->count < DEV_MAX) {
         char sp[64], st[16];
         if (sscanf(line, "%63s %15s", sp, st) == 2
-                && strncmp(sp, "List", 4) != 0) {
+                && (strcmp(st, "device") == 0 || strcmp(st, "offline") == 0
+                    || strcmp(st, "unauthorized") == 0)) {
             MultiByteToWideChar(CP_ACP, 0, sp, -1,
                                 dl->v[dl->count].serial, 64);
             MultiByteToWideChar(CP_ACP, 0, st, -1,
@@ -1234,7 +1302,8 @@ static unsigned __stdcall track_thread(void *arg)
     swprintf(cmd, MAX_PATH + 32, L"\"%s\" devices", g.adbPath);
     for (;;) {
         buf[0] = '\0';
-        if (capture_sync(cmd, buf, sizeof(buf), 10000, &ec)) {
+        if (capture_sync_cancel(cmd, buf, sizeof(buf), 10000, &ec, g.trackStop)
+                && ec == 0) {
             struct DevList dl;
             ZeroMemory(&dl, sizeof(dl));
             devlist_parse(buf, &dl);
@@ -1244,10 +1313,8 @@ static unsigned __stdcall track_thread(void *arg)
                     *heap_dl = dl;
                     last = dl;
                     have_last = true;
-                    if (g.hwnd) {
-                        PostMessageW(g.hwnd, WM_APP_DEVLIST,
-                                     (WPARAM) heap_dl, 0);
-                    } else {
+                    if (!g.hwnd || !PostMessageW(g.hwnd, WM_APP_DEVLIST,
+                                                 (WPARAM) heap_dl, 0)) {
                         free(heap_dl);
                     }
                 }
@@ -1286,7 +1353,7 @@ static void track_stop(void)
         SetEvent(g.trackStop);
     }
     if (g.hTrack) {
-        WaitForSingleObject(g.hTrack, 2000);
+        WaitForSingleObject(g.hTrack, INFINITE);
         CloseHandle(g.hTrack);
         g.hTrack = NULL;
     }
@@ -1481,6 +1548,7 @@ static unsigned __stdcall meta_thread(void *arg)
     struct DevMetaBatch *mb = calloc(1, sizeof(*mb));
     int i;
     if (mb) {
+        wcsncpy_s(mb->selected, 64, w->sel, _TRUNCATE);
         for (i = 0; i < w->count && mb->count < DEV_MAX; i++) {
             struct DevMeta *dm = &mb->v[mb->count];
             wcsncpy(dm->serial, w->serials[i], 63);
@@ -1506,9 +1574,7 @@ static unsigned __stdcall meta_thread(void *arg)
         }
     }
     free(w);
-    if (g.hwnd) {
-        PostMessageW(g.hwnd, WM_APP_DEVMETA, (WPARAM) mb, 0);
-    } else {
+    if (!g.hwnd || !PostMessageW(g.hwnd, WM_APP_DEVMETA, (WPARAM) mb, 0)) {
         free(mb);
     }
     return 0;
@@ -1607,36 +1673,33 @@ static unsigned __stdcall detect_thread(void *arg)
 
 static unsigned __stdcall notif_thread(void *arg)
 {
-    int settings = (int) (intptr_t) arg;
-    if (!g.notifFallback) {
-        wchar_t cmd[600];
-        char tmp[64];
-        DWORD ec = 1;
-        adb_cmd_fmt(cmd, 600, L" shell cmd statusbar expand-%s",
-                    settings ? L"settings" : L"notifications");
-        if (capture_sync(cmd, tmp, sizeof(tmp), 8000, &ec) && ec == 0) {
-            return 0;
-        }
-        g.notifFallback = true;
-        dbg_log(L"panel: cmd statusbar failed (ec=%lu), falling back to swipe", ec);
-    }
-    if (g.scrW > 0 && g.scrH > 0) {
+    struct AdbWork *w = arg;
+    wchar_t cmd[700];
+    char tmp[64];
+    DWORD ec = 1;
+    adb_cmd_fmt(w, cmd, 700, L" shell cmd statusbar expand-%s",
+                w->settings ? L"settings" : L"notifications");
+    bool ok = capture_sync(cmd, tmp, sizeof(tmp), 8000, &ec) && ec == 0;
+    if (!ok && w->scrW > 0 && w->scrH > 0) {
         /* notifications pull from top-center; control center from top-right */
-        int x = settings ? (g.scrW * 9) / 10 : g.scrW / 2;
-        adb_spawn(L" shell input swipe %d 1 %d %d 300",
-                  x, x, (g.scrH * 2) / 3);
+        int x = w->settings ? (w->scrW * 9) / 10 : w->scrW / 2;
+        adb_cmd_fmt(w, cmd, 700, L" shell input swipe %d 1 %d %d 300",
+                    x, x, (w->scrH * 2) / 3);
+        capture_sync(cmd, tmp, sizeof(tmp), 8000, &ec);
     }
+    free(w);
     return 0;
 }
 
 static unsigned __stdcall screenshot_thread(void *arg)
 {
-    wchar_t *path = (wchar_t *) arg;
+    struct AdbWork *w = arg;
+    const wchar_t *path = w->path;
     bool ok = false;
 
-    if (path && g.adbOk) {
+    if (path[0]) {
         wchar_t cmd[700];
-        adb_cmd_fmt(cmd, 700, L" exec-out screencap -p");
+        adb_cmd_fmt(w, cmd, 700, L" exec-out screencap -p");
         ok = run_redirect_to_file(cmd, path, 15000) && file_is_png(path);
         if (!ok) {
             /* Device-side fallback: screencap to /sdcard then pull.
@@ -1644,24 +1707,22 @@ static unsigned __stdcall screenshot_thread(void *arg)
              * stdout to the same path — capture and discard, then validate. */
             char tmp[128];
             DWORD ec = 1;
-            adb_cmd_fmt(cmd, 700, L" shell screencap -p /sdcard/scrdock_tmp.png");
+            adb_cmd_fmt(w, cmd, 700, L" shell screencap -p /sdcard/scrdock_tmp.png");
             if (capture_sync(cmd, tmp, sizeof(tmp), 10000, &ec) && ec == 0) {
-                adb_cmd_fmt(cmd, 700, L" pull /sdcard/scrdock_tmp.png \"%s\"", path);
+                adb_cmd_fmt(w, cmd, 700, L" pull /sdcard/scrdock_tmp.png \"%s\"", path);
                 if (capture_sync(cmd, tmp, sizeof(tmp), 15000, &ec) && ec == 0) {
                     ok = file_is_png(path);
                 }
             }
-            adb_spawn(L" shell rm -f /sdcard/scrdock_tmp.png");
+            adb_cmd_fmt(w, cmd, 700, L" shell rm -f /sdcard/scrdock_tmp.png");
+            capture_sync(cmd, tmp, sizeof(tmp), 8000, &ec);
         }
     }
 
-    if (path && ok) {
-        swprintf(g.tipStatus, MAX_PATH + 32, L"已保存: %s", path);
+    if (!PostMessageW(w->hwnd, WM_APP_SHOTDONE, (WPARAM) ok, (LPARAM) w)) {
+        g.shotBusy = false;
+        free(w);
     }
-    if (g.hwnd) {
-        PostMessageW(g.hwnd, WM_APP_SHOTDONE, (WPARAM) ok, 0);
-    }
-    free(path);
     return 0;
 }
 
@@ -1921,7 +1982,12 @@ static void paint_ui(HWND hwnd)
     GetClientRect(hwnd, &rc);
 
     HDC mem = CreateCompatibleDC(hdc);
-    HBITMAP bm = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+    HBITMAP bm = mem ? CreateCompatibleBitmap(hdc, rc.right, rc.bottom) : NULL;
+    if (!bm) {
+        if (mem) DeleteDC(mem);
+        EndPaint(hwnd, &ps);
+        return;
+    }
     HGDIOBJ old_bm = SelectObject(mem, bm);
 
     HBRUSH bg = CreateSolidBrush(RGB(32, 32, 32));
@@ -2128,7 +2194,7 @@ enum {
     MID_OPT_SAVE,
     MID_SCRCPY_ED, MID_SCRCPY_BR, MID_ADB_ED, MID_ADB_BR,
     MID_DETECT, MID_PATH_SAVE,
-    MID_PAIR_ADDR, MID_PAIR_CODE, MID_PAIR_GO
+    MID_PAIR_ADDR, MID_PAIR_CODE, MID_PAIR_GO, MID_PAIR_QR_REFRESH
 };
 
 static struct {
@@ -2511,17 +2577,23 @@ static void mgr_connect_selected(void)
     ini_save();
 
     int idx = ses_find(serial);
-    if (idx >= 0 && idx != g_active) {
-        ses_become_active(idx); /* running: just switch the toolbar to it */
-        swprintf(g.tipStatus, MAX_PATH + 32, L"已切换到 %s", serial);
+    if (idx == g_active && idx >= 0 && g.hProc) {
+        wcscpy(g.tipStatus, L"所选设备已是当前会话");
+        mgr_refresh();
         return;
     }
+    if (idx >= 0 && idx != g_active) {
+        ses_become_active(idx); /* running: just switch the toolbar to it */
+        if (g.hProc) {
+            swprintf(g.tipStatus, TIP_STATUS_LEN, L"已切换到 %s", serial);
+            return;
+        }
+    }
     g.reconnAttempts = 0;
-    g.procGen++; /* invalidate any queued PROCEXIT from the old child */
     if (!launch_scrcpy_ex(serial, true)) {
         wcscpy(g.tipStatus, L"启动失败：会话数已达上限（4）或 scrcpy 启动错误");
     } else {
-        swprintf(g.tipStatus, MAX_PATH + 32, L"已连接 %s", serial);
+        swprintf(g.tipStatus, TIP_STATUS_LEN, L"已连接 %s", serial);
     }
     mgr_refresh();
 }
@@ -2580,6 +2652,7 @@ static void mgr_opt_save(void)
 
 static void mgr_path_save(void)
 {
+    track_stop(); /* join before mutating paths read by the old poller */
     wchar_t buf[MAX_PATH];
     if (m.scrcpyEd) {
         GetWindowTextW(m.scrcpyEd, buf, MAX_PATH);
@@ -2839,37 +2912,139 @@ struct WifiResult {
     wchar_t addr[80];        /* discovered address (prefills the edit)  */
 };
 
-/* Parse "adb mdns services" output: lines look like
- *   <name> _adb-tls-connect._tcp 192.168.1.9:37123
- * Collect the ip:port tail of every connect service. */
-static int mdns_parse(const char *buf, wchar_t addrs[][80], int max)
+struct MdnsItem {
+    char name[128];
+    char type[80];
+    wchar_t addr[80];
+};
+
+/* Parse "adb mdns services" output robustly from right to left:
+ * <name> <type> <ip:port> */
+static int mdns_parse_items(const char *buf, struct MdnsItem *items, int max)
 {
-    char *dup = _strdup(buf ? buf : "");
-    int n = 0;
+    if (!buf || !items || max <= 0) return 0;
+    char *dup = _strdup(buf);
     if (!dup) return 0;
+    int count = 0;
     char *ctx = NULL;
-    for (char *line = strtok_s(dup, "\r\n", &ctx); line && n < max;
-            line = strtok_s(NULL, "\r\n", &ctx)) {
-        char name[256], type[80], addr[256];
-        if (sscanf(line, "%255s %79s %255s", name, type, addr) != 3
-                || (strcmp(type, "_adb-tls-connect._tcp") != 0
-                    && strcmp(type, "_adb-tls-connect._tcp.") != 0)) continue;
-        size_t len = strlen(addr);
-        char *colon = strrchr(addr, ':');
-        if (len >= 80 || !colon || colon == addr || !colon[1]) continue;
-        /* Only numeric network endpoints; never pass arbitrary output as args. */
-        if (strspn(addr, "0123456789abcdefABCDEF:.[]") != len) continue;
-        char *tail;
+    for (char *line = strtok_s(dup, "\r\n", &ctx); line && count < max;
+         line = strtok_s(NULL, "\r\n", &ctx)) {
+        while (*line == ' ' || *line == '\t') line++;
+        char *end = line + strlen(line);
+        while (end > line && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r')) {
+            *--end = '\0';
+        }
+        if (!*line || strncmp(line, "List of", 7) == 0) continue;
+
+        /* Find endpoint (last token) from the right */
+        char *p_end = end;
+        while (p_end > line && *(p_end - 1) != ' ' && *(p_end - 1) != '\t') {
+            p_end--;
+        }
+        if (p_end <= line) continue;
+        char *endpoint = p_end;
+        char *del1 = p_end - 1;
+        while (del1 > line && (*del1 == ' ' || *del1 == '\t')) del1--;
+        *(del1 + 1) = '\0';
+
+        /* Find service_type (token before endpoint) */
+        char *p_type = del1;
+        while (p_type > line && *(p_type - 1) != ' ' && *(p_type - 1) != '\t') {
+            p_type--;
+        }
+        if (p_type <= line) continue;
+        char *type = p_type;
+        char *del2 = p_type - 1;
+        while (del2 > line && (*del2 == ' ' || *del2 == '\t')) del2--;
+        *(del2 + 1) = '\0';
+        char *name = line;
+
+        /* Validate endpoint */
+        size_t elen = strlen(endpoint);
+        char *colon = strrchr(endpoint, ':');
+        if (elen >= 80 || !colon || colon == endpoint || !colon[1]) continue;
+        if (strspn(endpoint, "0123456789abcdefABCDEF:.[]") != elen) continue;
+        char *tail = NULL;
         long port = strtol(colon + 1, &tail, 10);
         if (*tail || port < 1 || port > 65535) continue;
-        wchar_t value[80];
-        if (!MultiByteToWideChar(CP_ACP, 0, addr, -1, value, 80)) continue;
-        int i;
-        for (i = 0; i < n && wcscmp(addrs[i], value); i++) {}
-        if (i == n) wcscpy(addrs[n++], value);
+
+        wchar_t waddr[80];
+        if (!MultiByteToWideChar(CP_ACP, 0, endpoint, -1, waddr, 80)) continue;
+
+        strncpy_s(items[count].name, sizeof(items[count].name), name, _TRUNCATE);
+        strncpy_s(items[count].type, sizeof(items[count].type), type, _TRUNCATE);
+        wcscpy_s(items[count].addr, 80, waddr);
+        count++;
     }
     free(dup);
+    return count;
+}
+
+static int mdns_parse(const char *buf, wchar_t addrs[][80], int max)
+{
+    struct MdnsItem items[16];
+    int total = mdns_parse_items(buf, items, 16);
+    int n = 0;
+    for (int i = 0; i < total && n < max; i++) {
+        if (strncmp(items[i].type, "_adb-tls-connect", 16) == 0) {
+            int j;
+            for (j = 0; j < n && wcscmp(addrs[j], items[i].addr) != 0; j++) {}
+            if (j == n) {
+                wcscpy_s(addrs[n++], 80, items[i].addr);
+            }
+        }
+    }
     return n;
+}
+
+static int mdns_parse_pairing(const char *buf, wchar_t addrs[][80], int max)
+{
+    struct MdnsItem items[16];
+    int total = mdns_parse_items(buf, items, 16);
+    int n = 0;
+    for (int i = 0; i < total && n < max; i++) {
+        if (strncmp(items[i].type, "_adb-tls-pairing", 16) == 0) {
+            int j;
+            for (j = 0; j < n && wcscmp(addrs[j], items[i].addr) != 0; j++) {}
+            if (j == n) {
+                wcscpy_s(addrs[n++], 80, items[i].addr);
+            }
+        }
+    }
+    return n;
+}
+
+static bool mdns_find_pairing_target(const char *buf, const char *service_name,
+                                     wchar_t *out_addr, size_t out_max)
+{
+    struct MdnsItem items[16];
+    int total = mdns_parse_items(buf, items, 16);
+
+    /* 1. 优先匹配指定服务实例名 (如 studio-xxxx) */
+    if (service_name && service_name[0]) {
+        size_t slen = strlen(service_name);
+        for (int i = 0; i < total; i++) {
+            if (strncmp(items[i].type, "_adb-tls-pairing", 16) == 0) {
+                if (strncmp(items[i].name, service_name, slen) == 0
+                        && (items[i].name[slen] == '\0'
+                            || strcmp(items[i].name + slen, "._adb-tls-pairing._tcp.") == 0
+                            || strcmp(items[i].name + slen, "._adb-tls-pairing._tcp") == 0)) {
+                    wcsncpy_s(out_addr, out_max, items[i].addr, _TRUNCATE);
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+static bool mdns_same_host(const wchar_t *a, const wchar_t *b)
+{
+    const wchar_t *pa = wcsrchr(a, L':');
+    const wchar_t *pb = wcsrchr(b, L':');
+    return pa && pb && pa != a && pb != b && pa - a == pb - b
+        && _wcsnicmp(a, b, (size_t)(pa - a)) == 0;
 }
 
 static void wifi_append(struct WifiResult *r, const wchar_t *text)
@@ -2988,19 +3163,395 @@ static void wifi_spawn_cmd(int mode, const wchar_t *a, const wchar_t *b)
     }
 }
 
-/* ---- wireless pairing mini-dialog (Android 11+) ---- */
+/* ---- wireless pairing mini-dialog (Android 11+ with QR scan) ---- */
+
+enum {
+    PAIR_PAGE_QR = 0,
+    PAIR_PAGE_MANUAL = 1,
+    PAIR_PAGE_COUNT = 2
+};
+
+enum {
+    QREV_WAITING = 0,
+    QREV_FOUND = 1,
+    QREV_PAIRING = 2,
+    QREV_PAIRED = 3,
+    QREV_CONNECTED = 4,
+    QREV_FAILED = 5
+};
+
+struct QrWork {
+    unsigned gen;
+    wchar_t code[16];
+    char service[32];
+    wchar_t adb[MAX_PATH];
+    HWND hwnd;
+    HANDLE stop;
+};
+
+struct QrEvent {
+    unsigned gen;
+    int code;
+    wchar_t text[160];
+};
+static unsigned g_qrGeneration;
 
 static struct {
     HWND frame;
-    HWND edAddr, edCode, go, out;
+    int tabSel;                 /* 0 = 扫码配对, 1 = 手动输入 */
     RECT hdrRc, closeRc;
+    RECT tabRc[PAIR_PAGE_COUNT];
+
+    /* 扫码配对组件 */
+    uint8_t qrData[qrcodegen_BUFFER_LEN_FOR_VERSION(6)];
+    int qrSize;
+    wchar_t qrCode[16];
+    wchar_t qrService[32];
+    RECT qrBox;                 /* 96-dpi: x=120, y=90, w=200, h=200 */
+    HWND qrStatus;
+    HWND qrRefresh;
+    HWND qrTip;
+    unsigned qrGen;
+    HANDLE qrStop;
+    HANDLE hQrThread;
+
+    /* 手动配对组件 */
+    HWND lblAddr, edAddr;
+    HWND lblCode, edCode;
+    HWND go, out, manualTip;
 } p;
+
+static void qr_stop(void)
+{
+    if (p.qrStop) SetEvent(p.qrStop);
+    if (p.hQrThread) {
+        WaitForSingleObject(p.hQrThread, INFINITE);
+        CloseHandle(p.hQrThread);
+        p.hQrThread = NULL;
+    }
+    if (p.qrStop) {
+        CloseHandle(p.qrStop);
+        p.qrStop = NULL;
+    }
+    MSG msg;
+    while (p.frame && PeekMessageW(&msg, p.frame, WM_APP_QREVENT,
+                                   WM_APP_QREVENT, PM_REMOVE)) {
+        free((void *)msg.lParam);
+    }
+}
+
+static void qr_post_event(const struct QrWork *w, int code, const wchar_t *text)
+{
+    if (WaitForSingleObject(w->stop, 0) == WAIT_OBJECT_0) return;
+    struct QrEvent *event = calloc(1, sizeof(*event));
+    if (!event) return;
+    event->gen = w->gen;
+    event->code = code;
+    wcsncpy_s(event->text, 160, text, _TRUNCATE);
+    if (!PostMessageW(w->hwnd, WM_APP_QREVENT, 0, (LPARAM) event)) free(event);
+}
+
+static unsigned __stdcall qr_pair_thread(void *arg)
+{
+    struct QrWork *w = (struct QrWork *) arg;
+    wchar_t code[16];
+    char service[32];
+    wcsncpy_s(code, 16, w->code, _TRUNCATE);
+    strncpy_s(service, sizeof(service), w->service, _TRUNCATE);
+
+    wchar_t cmd[MAX_PATH + 32];
+    char buf[4096];
+    swprintf(cmd, MAX_PATH + 32, L"\"%s\" mdns services", w->adb);
+
+    wchar_t pair_addr[80] = { 0 };
+
+    /* 轮询至多 60 秒等待手机扫码发起的 _adb-tls-pairing 广播 */
+    ULONGLONG deadline = GetTickCount64() + 60000;
+    while (GetTickCount64() < deadline) {
+        if (WaitForSingleObject(w->stop, 0) == WAIT_OBJECT_0) {
+            goto done;
+        }
+        DWORD ec = 1;
+        DWORD remaining = (DWORD)(deadline - GetTickCount64());
+        if (capture_sync_cancel(cmd, buf, sizeof(buf), remaining < 6000 ? remaining : 6000,
+                                &ec, w->stop) && ec == 0) {
+            if (mdns_find_pairing_target(buf, service, pair_addr, 80)) {
+                break;
+            }
+        }
+        if (WaitForSingleObject(w->stop, 1000) == WAIT_OBJECT_0) goto done;
+    }
+
+    if (WaitForSingleObject(w->stop, 0) == WAIT_OBJECT_0) {
+        goto done;
+    }
+
+    if (!pair_addr[0]) {
+        qr_post_event(w, QREV_FAILED, L"等待扫码超时，请点击下方刷新按钮重试");
+        goto done;
+    }
+
+    wchar_t msg[160];
+    swprintf(msg, 160, L"捕获到手机请求 (%s)，正在配对验证…", pair_addr);
+    qr_post_event(w, QREV_FOUND, msg);
+
+    /* 自动执行配对 */
+    wchar_t pair_cmd[MAX_PATH + 160];
+    char out[512] = { 0 };
+    DWORD ec = 1;
+    swprintf(pair_cmd, MAX_PATH + 160, L"\"%s\" pair %s %s", w->adb, pair_addr, code);
+    if (!capture_sync_cancel(pair_cmd, out, sizeof(out), 15000, &ec, w->stop)) {
+        qr_post_event(w, QREV_FAILED, L"执行配对指令超时");
+        goto done;
+    }
+
+    /* 去除首尾空白与换行 */
+    char *e = out + strlen(out);
+    while (e > out && (e[-1] == '\r' || e[-1] == '\n' || e[-1] == ' ')) {
+        *--e = '\0';
+    }
+
+    if (ec != 0 || (strstr(out, "Successfully paired") == NULL && strstr(out, "already paired") == NULL)) {
+        wchar_t werr[160];
+        werr[0] = L'\0';
+        if (out[0]) {
+            MultiByteToWideChar(CP_UTF8, 0, out, -1, werr, 159);
+        }
+        if (werr[0]) {
+            swprintf(msg, 160, L"配对失败：%s", werr);
+        } else {
+            swprintf(msg, 160, L"配对失败 (退出码 %lu)", ec);
+        }
+        qr_post_event(w, QREV_FAILED, msg);
+        goto done;
+    }
+
+    qr_post_event(w, QREV_PAIRED, L"配对成功！正在自动发现并连接…");
+
+    /* 稍等 1.5 秒让手机端 _adb-tls-connect 服务就绪 */
+    if (WaitForSingleObject(w->stop, 1500) == WAIT_OBJECT_0) goto done;
+
+    /* 提取配对成功的 IP 地址 */
+    wchar_t pair_ip[64] = { 0 };
+    wcsncpy_s(pair_ip, 64, pair_addr, _TRUNCATE);
+    wchar_t *col = wcsrchr(pair_ip, L':');
+    if (col) *col = L'\0';
+
+    /* 寻找 _adb-tls-connect 服务自动连接 */
+    wchar_t conn_addr[80] = { 0 };
+    for (int i = 0; i < 12; i++) {
+        if (WaitForSingleObject(w->stop, 0) == WAIT_OBJECT_0) goto done;
+        DWORD ec2 = 1;
+        if (capture_sync_cancel(cmd, buf, sizeof(buf), 6000, &ec2, w->stop) && ec2 == 0) {
+            struct MdnsItem items[16];
+            int n_items = mdns_parse_items(buf, items, 16);
+            for (int j = 0; j < n_items; j++) {
+                if (strncmp(items[j].type, "_adb-tls-connect", 16) == 0) {
+                    if (mdns_same_host(items[j].addr, pair_addr)) {
+                        wcsncpy_s(conn_addr, 80, items[j].addr, _TRUNCATE);
+                        break;
+                    }
+                }
+            }
+            if (conn_addr[0]) {
+                break;
+            }
+        }
+        if (WaitForSingleObject(w->stop, 1000) == WAIT_OBJECT_0) goto done;
+    }
+
+    if (conn_addr[0]) {
+        wchar_t ccmd[MAX_PATH + 160];
+        char cout[512] = { 0 };
+        DWORD ec3 = 1;
+        swprintf(ccmd, MAX_PATH + 160, L"\"%s\" connect %s", w->adb, conn_addr);
+        bool connected = capture_sync_cancel(ccmd, cout, sizeof(cout), 15000, &ec3, w->stop);
+        if (connected && ec3 == 0
+                && (strstr(cout, "connected to") || strstr(cout, "already connected"))) {
+            swprintf(msg, 160, L"配对并连接成功！(%s)", conn_addr);
+            qr_post_event(w, QREV_CONNECTED, msg);
+        } else {
+            swprintf(msg, 160, L"配对成功！请在设备列表中连接 %s", conn_addr);
+            qr_post_event(w, QREV_PAIRED, msg);
+        }
+    } else {
+        swprintf(msg, 160, L"配对成功！端点为 %s，请在设备列表中连接", pair_ip[0] ? pair_ip : L"手机");
+        qr_post_event(w, QREV_PAIRED, msg);
+    }
+
+done:
+    SecureZeroMemory(w->code, sizeof(w->code));
+    free(w);
+    return 0;
+}
+
+static void qr_generate(void)
+{
+    qr_stop();
+    p.qrGen = ++g_qrGeneration;
+
+    /* 生成 6 位随机数字密码和服务名 (采用 Android Studio 标准 studio- 前缀) */
+    HCRYPTPROV provider = 0;
+    unsigned random[3];
+    bool random_ok = CryptAcquireContextW(&provider, NULL, NULL, PROV_RSA_FULL,
+                                          CRYPT_VERIFYCONTEXT) != FALSE;
+    if (random_ok) {
+        random_ok = CryptGenRandom(provider, sizeof(random), (BYTE *)random) != FALSE;
+        CryptReleaseContext(provider, 0);
+    }
+    if (!random_ok) {
+        p.qrSize = 0;
+        SetWindowTextW(p.qrStatus, L"生成配对凭据失败，请重试");
+        InvalidateRect(p.frame, NULL, FALSE);
+        return;
+    }
+    unsigned code_num = 100000 + (random[0] % 900000);
+    char code_a[16];
+    char serv_a[32];
+    snprintf(code_a, sizeof(code_a), "%06u", code_num);
+    snprintf(serv_a, sizeof(serv_a), "studio-%08x%08x", random[1], random[2]);
+    MultiByteToWideChar(CP_UTF8, 0, code_a, -1, p.qrCode, 16);
+    MultiByteToWideChar(CP_UTF8, 0, serv_a, -1, p.qrService, 32);
+
+    char payload[128];
+    snprintf(payload, sizeof(payload), "WIFI:T:ADB;S:%s;P:%s;;", serv_a, code_a);
+
+    uint8_t tempBuffer[qrcodegen_BUFFER_LEN_FOR_VERSION(6)];
+    bool ok = qrcodegen_encodeText(payload, tempBuffer, p.qrData,
+                                   qrcodegen_Ecc_LOW,
+                                   qrcodegen_VERSION_MIN, 6,
+                                   qrcodegen_Mask_AUTO, true);
+    if (ok) {
+        p.qrSize = qrcodegen_getSize(p.qrData);
+    } else {
+        p.qrSize = 0;
+        SetWindowTextW(p.qrStatus, L"生成二维码失败，请重试");
+        InvalidateRect(p.frame, NULL, FALSE);
+        return;
+    }
+
+    if (p.qrStatus && IsWindow(p.qrStatus)) {
+        wchar_t tip[160];
+        swprintf(tip, 160, L"等待扫码… 配对码: %s\n请用手机【无线调试】扫描上方二维码", p.qrCode);
+        SetWindowTextW(p.qrStatus, tip);
+    }
+
+    if (p.frame && IsWindow(p.frame)) {
+        InvalidateRect(p.frame, NULL, FALSE);
+    }
+
+    struct QrWork *w = malloc(sizeof(*w));
+    if (w) {
+        p.qrStop = CreateEventW(NULL, TRUE, FALSE, NULL);
+        if (!p.qrStop) {
+            free(w);
+            SetWindowTextW(p.qrStatus, L"创建配对任务失败，请重试");
+            return;
+        }
+        w->gen = p.qrGen;
+        w->stop = p.qrStop;
+        w->hwnd = p.frame;
+        wcscpy_s(w->adb, MAX_PATH, g.adbPath);
+        wcsncpy_s(w->code, 16, p.qrCode, _TRUNCATE);
+        strncpy_s(w->service, sizeof(w->service), serv_a, _TRUNCATE);
+        uintptr_t th = _beginthreadex(NULL, 0, qr_pair_thread, w, 0, NULL);
+        if (th) {
+            p.hQrThread = (HANDLE) th;
+        } else {
+            free(w);
+            qr_stop();
+            SetWindowTextW(p.qrStatus, L"启动配对任务失败，请重试");
+        }
+    } else {
+        SetWindowTextW(p.qrStatus, L"创建配对任务失败，请重试");
+    }
+}
+
+static void pair_show_page(int page)
+{
+    p.tabSel = page;
+    bool is_qr = (page == PAIR_PAGE_QR);
+    int show_qr = is_qr ? SW_SHOW : SW_HIDE;
+    int show_man = is_qr ? SW_HIDE : SW_SHOW;
+
+    if (p.qrStatus) ShowWindow(p.qrStatus, show_qr);
+    if (p.qrRefresh) ShowWindow(p.qrRefresh, show_qr);
+    if (p.qrTip) ShowWindow(p.qrTip, show_qr);
+
+    if (p.lblAddr) ShowWindow(p.lblAddr, show_man);
+    if (p.edAddr) ShowWindow(p.edAddr, show_man);
+    if (p.lblCode) ShowWindow(p.lblCode, show_man);
+    if (p.edCode) ShowWindow(p.edCode, show_man);
+    if (p.go) ShowWindow(p.go, show_man);
+    if (p.out) ShowWindow(p.out, show_man);
+    if (p.manualTip) ShowWindow(p.manualTip, show_man);
+
+    if (is_qr && p.qrSize == 0) {
+        qr_generate();
+    }
+    if (p.frame && IsWindow(p.frame)) {
+        InvalidateRect(p.frame, NULL, FALSE);
+    }
+}
+
+static void draw_qrcode_box(HDC dc, const RECT *box, const uint8_t *qrcode, int qrsize)
+{
+    HBRUSH bg_br = CreateSolidBrush(RGB(40, 40, 43));
+    HPEN border_pen = CreatePen(PS_SOLID, 1, RGB(70, 70, 75));
+    HGDIOBJ old_p = SelectObject(dc, border_pen);
+    HGDIOBJ old_b = SelectObject(dc, bg_br);
+    RoundRect(dc, box->left, box->top, box->right, box->bottom, 10, 10);
+    SelectObject(dc, old_b);
+    SelectObject(dc, old_p);
+    DeleteObject(border_pen);
+    DeleteObject(bg_br);
+
+    if (!qrcode || qrsize <= 0) {
+        return;
+    }
+
+    int margin = 8;
+    int avail_w = (box->right - box->left) - margin * 2;
+    int avail_h = (box->bottom - box->top) - margin * 2;
+    int side = avail_w < avail_h ? avail_w : avail_h;
+
+    int qz = 4; // quiet zone 4 modules (standard QR specification)
+    int total_cells = qrsize + qz * 2;
+    int cell_size = side / total_cells;
+    if (cell_size < 1) cell_size = 1;
+    int card_size = cell_size * total_cells;
+
+    int qr_x = box->left + ((box->right - box->left) - card_size) / 2;
+    int qr_y = box->top + ((box->bottom - box->top) - card_size) / 2;
+
+    RECT card_rc = { qr_x, qr_y, qr_x + card_size, qr_y + card_size };
+    HBRUSH white_br = CreateSolidBrush(RGB(255, 255, 255));
+    FillRect(dc, &card_rc, white_br);
+    DeleteObject(white_br);
+
+    HBRUSH black_br = CreateSolidBrush(RGB(0, 0, 0));
+    for (int y = 0; y < qrsize; y++) {
+        for (int x = 0; x < qrsize; x++) {
+            if (qrcodegen_getModule(qrcode, x, y)) {
+                RECT r = {
+                    qr_x + (x + qz) * cell_size,
+                    qr_y + (y + qz) * cell_size,
+                    qr_x + (x + qz + 1) * cell_size,
+                    qr_y + (y + qz + 1) * cell_size
+                };
+                FillRect(dc, &r, black_br);
+            }
+        }
+    }
+    DeleteObject(black_br);
+}
 
 static void pair_paint(HWND hwnd, HDC dc)
 {
     RECT rc;
     UINT dpi = wnd_dpi(hwnd);
     GetClientRect(hwnd, &rc);
+
     /* header */
     RECT hdr = { 0, 0, rc.right, MulDiv(42, dpi, 96) };
     p.hdrRc = hdr;
@@ -3008,6 +3559,7 @@ static void pair_paint(HWND hwnd, HDC dc)
     p.closeRc.top = MulDiv(7, dpi, 96);
     p.closeRc.right = rc.right - MulDiv(10, dpi, 96);
     p.closeRc.bottom = MulDiv(37, dpi, 96);
+
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, RGB(235, 235, 235));
     HGDIOBJ old_f = SelectObject(dc, m.fontB ? m.fontB : g.fUi);
@@ -3015,6 +3567,8 @@ static void pair_paint(HWND hwnd, HDC dc)
     tr.left += MulDiv(16, dpi, 96);
     DrawTextW(dc, L"无线配对（Android 11+）", -1, &tr,
               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    /* close button */
     HBRUSH br = CreateSolidBrush(RGB(43, 43, 43));
     HPEN pen = CreatePen(PS_SOLID, 1, RGB(70, 70, 70));
     HGDIOBJ op = SelectObject(dc, pen);
@@ -3033,6 +3587,31 @@ static void pair_paint(HWND hwnd, HDC dc)
         DrawTextW(dc, L"X", -1, &p.closeRc,
                   DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
+
+    /* Tab buttons (扫码配对 / 手动配对) */
+    static const wchar_t *kTabNames[PAIR_PAGE_COUNT] = { L"扫码配对", L"手动配对" };
+    for (int i = 0; i < PAIR_PAGE_COUNT; i++) {
+        RECT trc = p.tabRc[i];
+        bool active = (i == p.tabSel);
+        HBRUSH tbr = CreateSolidBrush(active ? RGB(44, 96, 160) : RGB(43, 43, 43));
+        HPEN tpen = CreatePen(PS_SOLID, 1, active ? RGB(70, 120, 180) : RGB(70, 70, 70));
+        HGDIOBJ top = SelectObject(dc, tpen);
+        HGDIOBJ tob = SelectObject(dc, tbr);
+        RoundRect(dc, trc.left, trc.top, trc.right, trc.bottom, 6, 6);
+        SelectObject(dc, tob);
+        SelectObject(dc, top);
+        DeleteObject(tpen);
+        DeleteObject(tbr);
+        SetTextColor(dc, RGB(240, 240, 240));
+        SelectObject(dc, m.font ? m.font : g.fUi);
+        DrawTextW(dc, kTabNames[i], -1, &trc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+
+    /* 扫码模式下自绘二维码 */
+    if (p.tabSel == PAIR_PAGE_QR) {
+        draw_qrcode_box(dc, &p.qrBox, p.qrData, p.qrSize);
+    }
+
     SelectObject(dc, old_f);
 }
 
@@ -3080,6 +3659,12 @@ static LRESULT CALLBACK pair_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 DestroyWindow(hwnd);
                 return 0;
             }
+            for (int i = 0; i < PAIR_PAGE_COUNT; i++) {
+                if (PtInRect(&p.tabRc[i], pt)) {
+                    pair_show_page(i);
+                    return 0;
+                }
+            }
         }
         return 0;
     case WM_CTLCOLORSTATIC:
@@ -3101,6 +3686,10 @@ static LRESULT CALLBACK pair_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         break;
     case WM_COMMAND:
+        if (LOWORD(wp) == MID_PAIR_QR_REFRESH) {
+            qr_generate();
+            return 0;
+        }
         if (LOWORD(wp) == MID_PAIR_GO) {
             wchar_t a[80], c[16];
             GetWindowTextW(p.edAddr, a, 80);
@@ -3121,12 +3710,29 @@ static LRESULT CALLBACK pair_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
             SetWindowTextW(p.out, L"配对中…");
             wifi_spawn_cmd(1, a, c);
+            return 0;
+        }
+        return 0;
+    case WM_APP_QREVENT:
+        {
+            struct QrEvent *event = (struct QrEvent *) lp;
+            if (event && event->gen == p.qrGen) {
+                if (p.qrStatus && IsWindow(p.qrStatus)) {
+                    SetWindowTextW(p.qrStatus, event->text);
+                }
+                if (event->code == QREV_CONNECTED || event->code == QREV_PAIRED) {
+                    meta_spawn();
+                    mgr_refresh();
+                }
+            }
+            free(event);
         }
         return 0;
     case WM_CLOSE:
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
+        qr_stop();
         ZeroMemory(&p, sizeof(p));
         return 0;
     default:
@@ -3150,11 +3756,11 @@ static void pair_open(HWND owner)
     wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
     RegisterClassW(&wc);
 
-    int w96 = 420, h96 = 300;
+    int w96 = 440, h96 = 460;
     RECT or_;
     GetWindowRect(owner, &or_);
     int mx = or_.left + 40;
-    int my = or_.top + 80;
+    int my = or_.top + 60;
     p.frame = CreateWindowExW(0, L"scrdock_pair_cls", L"scrdock 配对",
                               WS_POPUP,
                               mx, my,
@@ -3165,22 +3771,52 @@ static void pair_open(HWND owner)
     }
     mgr_dark_titlebar(p.frame);
 
+    /* Tab strip cells */
+    p.tabRc[0].left = MulDiv(16, dpi, 96);
+    p.tabRc[0].top = MulDiv(48, dpi, 96);
+    p.tabRc[0].right = MulDiv(136, dpi, 96);
+    p.tabRc[0].bottom = MulDiv(80, dpi, 96);
+
+    p.tabRc[1].left = MulDiv(146, dpi, 96);
+    p.tabRc[1].top = MulDiv(48, dpi, 96);
+    p.tabRc[1].right = MulDiv(266, dpi, 96);
+    p.tabRc[1].bottom = MulDiv(80, dpi, 96);
+
+    /* QR Box (Client coordinates) */
+    p.qrBox.left = MulDiv(120, dpi, 96);
+    p.qrBox.top = MulDiv(90, dpi, 96);
+    p.qrBox.right = MulDiv(320, dpi, 96);
+    p.qrBox.bottom = MulDiv(290, dpi, 96);
+
     HWND f = p.frame;
-    mkctl(f, L"STATIC", SS_NOPREFIX | SS_CENTERIMAGE,
-          L"配对地址 (ip:端口)", 16, 56, 130, MG_ROW_H_96, 0, dpi);
+
+    /* 扫码配对控件 */
+    p.qrStatus = mkctl(f, L"STATIC", SS_NOPREFIX | SS_CENTER,
+                       L"", 16, 298, 408, 44, 0, dpi);
+    p.qrRefresh = mkctl(f, L"BUTTON", WS_TABSTOP,
+                        L"重新生成二维码", 145, 348, 150, MG_BTN_H_96, MID_PAIR_QR_REFRESH, dpi);
+    p.qrTip = mkctl(f, L"STATIC", SS_NOPREFIX | SS_CENTER,
+                    L"手机与电脑需连接至同一 Wi-Fi 网络。\n扫码后将自动完成配对与连接。",
+                    16, 396, 408, 40, 0, dpi);
+
+    /* 手动配对控件 */
+    p.lblAddr = mkctl(f, L"STATIC", SS_NOPREFIX | SS_CENTERIMAGE,
+                      L"配对地址 (ip:端口)", 16, 100, 130, MG_ROW_H_96, 0, dpi);
     p.edAddr = mkctl(f, L"EDIT", ES_AUTOHSCROLL | WS_TABSTOP,
-                     L"", 152, 56, 240, MG_ROW_H_96, MID_PAIR_ADDR, dpi);
-    mkctl(f, L"STATIC", SS_NOPREFIX | SS_CENTERIMAGE,
-          L"配对码", 16, 100, 130, MG_ROW_H_96, 0, dpi);
+                     L"", 152, 100, 260, MG_ROW_H_96, MID_PAIR_ADDR, dpi);
+    p.lblCode = mkctl(f, L"STATIC", SS_NOPREFIX | SS_CENTERIMAGE,
+                      L"配对码", 16, 148, 130, MG_ROW_H_96, 0, dpi);
     p.edCode = mkctl(f, L"EDIT", ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP,
-                     L"", 152, 100, 100, MG_ROW_H_96, MID_PAIR_CODE, dpi);
+                     L"", 152, 148, 120, MG_ROW_H_96, MID_PAIR_CODE, dpi);
     p.go = mkctl(f, L"BUTTON", WS_TABSTOP, L"开始配对",
-                 152, 148, 110, MG_BTN_H_96, MID_PAIR_GO, dpi);
+                 152, 196, 110, MG_BTN_H_96, MID_PAIR_GO, dpi);
     p.out = mkctl(f, L"STATIC", SS_NOPREFIX | SS_CENTERIMAGE, L"",
-                  16, 196, 388, 56, 0, dpi);
-    mkctl(f, L"STATIC", SS_NOPREFIX | SS_CENTERIMAGE,
-          L"手机: 设置 → 开发者选项 → 无线调试 → 用配对码配对设备",
-          16, 262, 388, MG_ROW_H_96, 0, dpi);
+                  16, 246, 408, 56, 0, dpi);
+    p.manualTip = mkctl(f, L"STATIC", SS_NOPREFIX | SS_CENTERIMAGE,
+                        L"手机: 设置 → 开发者选项 → 无线调试 → 用配对码配对设备",
+                        16, 320, 408, MG_ROW_H_96, 0, dpi);
+
+    pair_show_page(PAIR_PAGE_QR);
     ShowWindow(p.frame, SW_SHOW);
 }
 
@@ -3365,8 +4001,18 @@ static LRESULT CALLBACK mgr_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     /* active session (or none selected): graceful close,
                      * then follow the next remaining session if any */
                     g.reconnPending = false;
-                    KillTimer(NULL, TIMER_RECONN);
+                    KillTimer(g.hwnd, TIMER_RECONN);
                     close_scrcpy_and_wait();
+                    err_drain(true);
+                    if (g.hProc) {
+                        CloseHandle(g.hProc);
+                        g.hProc = NULL;
+                    }
+                    g.procGen = ++g_genSeq;
+                    g.pid = 0;
+                    g.target = NULL;
+                    hooks_remove();
+                    KillTimer(g.hwnd, TIMER_HUNT);
                     int a = g_active;
                     g_active = -1;
                     if (a >= 0) {
@@ -3702,11 +4348,13 @@ static void button_fire(int id)
             break;
         }
         {
+            struct AdbWork *w = adb_work_new();
+            if (!w) break;
             uintptr_t th = _beginthreadex(NULL, 0, notif_thread,
-                                          (void *) (intptr_t) 0, 0, NULL);
+                                          w, 0, NULL);
             if (th) {
                 CloseHandle((HANDLE) th);
-            }
+            } else free(w);
         }
         break;
     case ID_CC:
@@ -3715,11 +4363,14 @@ static void button_fire(int id)
          * presses), which pops both panels on MIUI. cmd statusbar
          * expand-settings opens the control center alone. */
         {
+            struct AdbWork *w = adb_work_new();
+            if (!w) break;
+            w->settings = true;
             uintptr_t th = _beginthreadex(NULL, 0, notif_thread,
-                                          (void *) (intptr_t) 1, 0, NULL);
+                                          w, 0, NULL);
             if (th) {
                 CloseHandle((HANDLE) th);
-            }
+            } else free(w);
         }
         break;
     case ID_SHOT:
@@ -3727,22 +4378,22 @@ static void button_fire(int id)
             if (g.shotBusy) {
                 break;
             }
-            wchar_t *path = malloc(sizeof(wchar_t) * MAX_PATH);
-            if (!path) {
+            struct AdbWork *w = adb_work_new();
+            if (!w) {
                 break;
             }
-            if (!make_shot_path(path, MAX_PATH)) {
-                free(path);
+            if (!make_shot_path(w->path, MAX_PATH)) {
+                free(w);
                 break;
             }
             g.shotBusy = true;
-            uintptr_t th = _beginthreadex(NULL, 0, screenshot_thread, path,
+            uintptr_t th = _beginthreadex(NULL, 0, screenshot_thread, w,
                                           0, NULL);
             if (th) {
                 CloseHandle((HANDLE) th);
             } else {
                 g.shotBusy = false;
-                free(path);
+                free(w);
             }
         }
         break;
@@ -3784,7 +4435,7 @@ static void reconn_arm(void)
 static void ses_become_active(int idx)
 {
     struct Session *s;
-    if (idx < 0 || idx >= SES_MAX || !g_ses[idx].used) {
+    if (idx < 0 || idx >= SES_MAX || !g_ses[idx].used || idx == g_active) {
         return;
     }
     /* demote the current active session back into its slot */
@@ -3798,10 +4449,21 @@ static void ses_become_active(int idx)
         cur->launchTick = g.launchTick;
         cur->reconnAttempts = g.reconnAttempts;
         cur->reconnPending = g.reconnPending;
+        cur->pinned_mod = g.pinned_mod;
         wcsncpy(cur->serial, g.serial, 63);
         cur->serial[63] = L'\0';
     }
     s = &g_ses[idx];
+    if (!s->hProc) {
+        /* background session already exited: relaunch instead of adopting a
+         * dead handle (which would leave g.pid stale and hooks_install
+         * hooking an exited PID). Save serial first: ses_free zeroes it. */
+        wchar_t dead_serial[64];
+        wcsncpy_s(dead_serial, 64, s->serial, _TRUNCATE);
+        ses_free(idx);
+        launch_scrcpy_ex(dead_serial, true);
+        return;
+    }
     g.hProc = s->hProc;
     g.hErr = s->hErr;
     g.pid = s->pid;
@@ -3809,6 +4471,10 @@ static void ses_become_active(int idx)
     g.launchTick = s->launchTick;
     g.reconnAttempts = s->reconnAttempts;
     g.reconnPending = s->reconnPending;
+    g.pinned_mod = s->pinned_mod;
+    g.scrW = g.scrH = 0;
+    g.errBuf[0] = '\0';
+    g.errLine[0] = L'\0';
     wcsncpy(g.serial, s->serial, 127);
     g.serial[127] = L'\0';
     g.launched = true;
@@ -3823,6 +4489,7 @@ static void ses_become_active(int idx)
         reconn_arm(); /* resume a pending reconnect of this session */
     }
     mgr_refresh();
+    meta_spawn();
     InvalidateRect(g.hwnd, NULL, FALSE);
 }
 
@@ -3833,20 +4500,23 @@ static void devlist_apply(struct DevList *dl)
         return;
     }
     struct DevList *old = g.devList;
-    bool changed = !old || old->count != dl->count
-        || memcmp(old->v, dl->v,
-                  sizeof(struct DevInfo) * (size_t) dl->count) != 0;
+    bool changed = !old || old->count != dl->count;
+    if (!changed && dl->count <= DEV_MAX) {
+        changed = memcmp(old->v, dl->v,
+                         sizeof(struct DevInfo) * (size_t) dl->count) != 0;
+    }
     g.devList = dl;
     free(old);
 
-    /* Selection: a pinned serial (serial= in ini) always wins. In auto
-     * mode, follow the first online device whenever ours disappears —
-     * exactly one device attached means "just works" like before. */
-    if (!g.cfg.serial[0] && !dev_online(g.serial)) {
+    /* Active/reconnecting sessions keep their identity across disconnects.
+     * Only an idle auto-mode toolbar selects the unique online device. */
+    if (!g.cfg.serial[0] && g_active < 0 && !g.reconnPending
+            && !g.launched && !dev_online(g.serial)) {
         int i;
         g.serial[0] = L'\0';
         for (i = 0; i < g.devList->count; i++) {
-            if (wcscmp(g.devList->v[i].state, L"device") == 0) {
+            if (dev_count_online() == 1
+                    && wcscmp(g.devList->v[i].state, L"device") == 0) {
                 wcsncpy(g.serial, g.devList->v[i].serial, 127);
                 g.serial[127] = L'\0';
                 break;
@@ -3855,14 +4525,16 @@ static void devlist_apply(struct DevList *dl)
     }
     g.devNone = (dev_count_online() == 0);
 
-    if (g.bootLaunch) {
+    if (g.bootLaunch && g.serial[0] && dev_online(g.serial)) {
         /* first snapshot: the serial is resolved, so launch with -s */
         g.bootLaunch = false;
         if (!launch_scrcpy()) {
-            swprintf(g.tipStatus, MAX_PATH + 32,
+            swprintf(g.tipStatus, TIP_STATUS_LEN,
                      L"启动 scrcpy 失败 (code %lu)", GetLastError());
             mgr_open();
         }
+    } else if (g.bootLaunch && !m.frame) {
+        mgr_open(); /* zero or multiple devices: let the user select */
     }
 
     /* the device came back while we were waiting to reconnect */
@@ -3910,7 +4582,7 @@ static void teardown(HWND hwnd)
         /* background sessions do not survive the toolbar either */
         int i;
         for (i = 0; i < SES_MAX; i++) {
-            if (g_ses[i].used && g_ses[i].hProc) {
+            if (g.cfg.close_on_exit && g_ses[i].used && g_ses[i].hProc) {
                 TerminateProcess(g_ses[i].hProc, 1);
             }
             ses_free(i);
@@ -4096,6 +4768,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
             break;
         case TIMER_SYNC:
+            ses_drain_background();
             if (g.target && !IsWindow(g.target)) {
                 hunting_start();
             }
@@ -4128,6 +4801,13 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (!g.reconnPending || g.hProc) {
                 break;
             }
+            if (g.reconnAttempts >= g.cfg.reconnect_attempts) {
+                g.reconnPending = false;
+                wcscpy(g.tipStatus, L"重连次数已用完，请打开管理窗口手动连接");
+                mgr_refresh();
+                break;
+            }
+            g.reconnAttempts++;
             if (!dev_online(g.serial)) {
                 /* keep trying to bring a WiFi device back (cheap, idempotent);
                  * DEVLIST re-arms immediately once it appears */
@@ -4145,25 +4825,18 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                         }
                     }
                 }
-                if (g.reconnAttempts < g.cfg.reconnect_attempts) {
-                    reconn_arm(); /* retry loop until budget is spent */
-                }
+                reconn_arm(); /* next tick publishes budget exhaustion */
                 break;
             }
-            if (g.reconnAttempts >= g.cfg.reconnect_attempts) {
-                g.reconnPending = false;
-                wcscpy(g.tipStatus, L"重连次数已用完，请打开管理窗口手动连接");
-                mgr_refresh();
-                break;
-            }
-            g.reconnAttempts++;
             if (launch_scrcpy()) {
-                swprintf(g.tipStatus, MAX_PATH + 32, L"已重连 (%d/%d)",
+                swprintf(g.tipStatus, TIP_STATUS_LEN, L"已重连 (%d/%d)",
                          g.reconnAttempts, g.cfg.reconnect_attempts);
             } else {
-                swprintf(g.tipStatus, MAX_PATH + 32,
+                swprintf(g.tipStatus, TIP_STATUS_LEN,
                          L"重连失败: 无法启动 scrcpy (code %lu)",
                          GetLastError());
+                g.reconnPending = true;
+                reconn_arm();
             }
             mgr_refresh();
             InvalidateRect(hwnd, NULL, FALSE);
@@ -4181,7 +4854,8 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         {
             struct DevMetaBatch *mb = (struct DevMetaBatch *) wp;
             if (mb) {
-                if (mb->scrW > 0 && mb->scrH > 0) {
+                if (wcscmp(mb->selected, g.serial) == 0
+                        && mb->scrW > 0 && mb->scrH > 0) {
                     g.scrW = mb->scrW;
                     g.scrH = mb->scrH;
                 }
@@ -4227,8 +4901,8 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 } else if (m.status && IsWindow(m.status)) {
                     SetWindowTextW(m.status, r->text);
                 }
-                wcsncpy(g.tipStatus, r->text, MAX_PATH + 31);
-                g.tipStatus[MAX_PATH + 31] = L'\0';
+                wcsncpy(g.tipStatus, r->text, TIP_STATUS_LEN - 1);
+                g.tipStatus[TIP_STATUS_LEN - 1] = L'\0';
                 free(r);
             }
         }
@@ -4252,11 +4926,11 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g.target = NULL;
             /* scrcpy exit codes: 0 = closed, 1 = startup failure,
              * 2 = device disconnected while running */
+            if (code == 2 && GetTickCount64() - g.launchTick > 10000) {
+                g.reconnAttempts = 0; /* stable session: fresh budget */
+            }
             if (code == 2 && g.cfg.auto_reconnect
                     && g.reconnAttempts < g.cfg.reconnect_attempts) {
-                if (GetTickCount64() - g.launchTick > 10000) {
-                    g.reconnAttempts = 0; /* stable session: fresh budget */
-                }
                 g.reconnPending = true;
                 /* wireless: after a --tcpip switch or a dropped WiFi link
                  * the device lives under an "ip:port" serial instead */
@@ -4280,11 +4954,9 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                         }
                     }
                 }
-                swprintf(g.tipStatus, MAX_PATH + 32, L"设备断开，重连中 (%d/%d)",
+                swprintf(g.tipStatus, TIP_STATUS_LEN, L"设备断开，重连中 (%d/%d)",
                          g.reconnAttempts + 1, g.cfg.reconnect_attempts);
-                if (dev_online(g.serial)) {
-                    reconn_arm();
-                }
+                reconn_arm();
                 mgr_refresh();
                 InvalidateRect(hwnd, NULL, FALSE);
                 return 0;
@@ -4311,7 +4983,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 return 0;
             }
             /* failed (and not reconnecting): stay alive, surface the error */
-            swprintf(g.tipStatus, MAX_PATH + 32, L"scrcpy 已退出 (code %lu)",
+            swprintf(g.tipStatus, TIP_STATUS_LEN, L"scrcpy 已退出 (code %lu)",
                      code);
             {
                 int a = g_active;
@@ -4341,7 +5013,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         {
             int idx = (int) wp;
             if (idx >= 0 && idx < SES_MAX && g_ses[idx].used) {
-                swprintf(g.tipStatus, MAX_PATH + 32, L"会话已结束: %s",
+                swprintf(g.tipStatus, TIP_STATUS_LEN, L"会话已结束: %s",
                          g_ses[idx].serial);
                 ses_free(idx);
                 mgr_refresh();
@@ -4350,6 +5022,11 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_APP_SHOTDONE:
+        {
+            struct AdbWork *w = (struct AdbWork *) lp;
+            if (wp && w) swprintf(g.tipStatus, TIP_STATUS_LEN, L"已保存: %s", w->path);
+            free(w);
+        }
         g.shotBusy = false;
         g.flashBtn = ID_SHOT;
         g.flashOk = (wp != 0);
@@ -4410,11 +5087,11 @@ static int run_loop(void)
                 g.hProc = NULL;
             } else {
                 struct Session *s = &g_ses[idx];
-                if (g.hwnd) {
-                    PostMessageW(g.hwnd, WM_APP_SESEXIT, (WPARAM) idx, 0);
-                }
                 CloseHandle(s->hProc);
                 s->hProc = NULL;
+                if (g.hwnd) {
+                    SendMessageW(g.hwnd, WM_APP_SESEXIT, (WPARAM) idx, 0);
+                }
             }
             continue;
         }
@@ -4427,7 +5104,12 @@ static int run_loop(void)
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
-        } else if (r == WAIT_FAILED) {
+        } else {
+            /* WAIT_FAILED, or an out-of-range value after the handle set
+             * changed mid-dispatch: exit the loop rather than spin. */
+            if (r != WAIT_FAILED) {
+                dbg_log(L"run_loop: unexpected wait result %lu (n=%d)", r, n);
+            }
             break;
         }
     }
@@ -4472,9 +5154,12 @@ int WINAPI wWinMain(HINSTANCE h_inst, HINSTANCE h_prev, PWSTR cmd_line,
     icc.dwICC = ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES | ICC_STANDARD_CLASSES;
     InitCommonControlsEx(&icc);
 
-    SetLastError(0);
-    CreateMutexW(NULL, TRUE, L"Local\\scrdock_single");
+    HANDLE hMutex = CreateMutexW(NULL, TRUE, L"Local\\scrdock_single");
+    if (!hMutex) {
+        return 1;
+    }
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(hMutex);
         return 0;
     }
 
@@ -4534,6 +5219,7 @@ int WINAPI wWinMain(HINSTANCE h_inst, HINSTANCE h_prev, PWSTR cmd_line,
                         L"请把 scrdock.exe 放到 scrcpy 所在目录，\n"
                         L"或确保 scrcpy 在 PATH 中。",
                         L"scrdock", MB_ICONERROR);
+            CloseHandle(hMutex);
             return 1;
     } else if (g.adbOk) {
         /* adb known: wait for the first device snapshot, then launch with
@@ -4541,11 +5227,13 @@ int WINAPI wWinMain(HINSTANCE h_inst, HINSTANCE h_prev, PWSTR cmd_line,
         g.bootLaunch = true;
     } else if (!launch_scrcpy()) {
             MessageBoxW(NULL, L"启动 scrcpy 失败。", L"scrdock", MB_ICONERROR);
+            CloseHandle(hMutex);
             return 1;
     }
 
     register_and_create();
     if (!g.hwnd) {
+        CloseHandle(hMutex);
         return 1;
     }
 
@@ -4588,5 +5276,6 @@ int WINAPI wWinMain(HINSTANCE h_inst, HINSTANCE h_prev, PWSTR cmd_line,
         CloseHandle(g.hNul);
         g.hNul = NULL;
     }
+    CloseHandle(hMutex);
     return rc;
 }
