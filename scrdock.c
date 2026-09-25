@@ -2502,7 +2502,8 @@ static const wchar_t *dev_conn_text(const wchar_t *serial)
     if (wcsncmp(serial, L"emulator-", 9) == 0) {
         return L"模拟器";
     }
-    if (wcschr(serial, L':')) {
+    if (wcschr(serial, L':')
+            || wcsstr(serial, L"._adb-tls-connect._tcp")) {
         return L"网络";
     }
     return L"USB";

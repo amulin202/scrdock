@@ -398,6 +398,16 @@ static void test_device_capture(void)
     puts("PASS device capture: inherited writer, valid empty snapshots, reject failed/truncated captures");
 }
 
+static void test_connection_classification(void)
+{
+    CHECK(wcscmp(dev_conn_text(L"usb-serial"), L"USB") == 0);
+    CHECK(wcscmp(dev_conn_text(L"192.0.2.10:5555"), L"网络") == 0);
+    CHECK(wcscmp(dev_conn_text(L"emulator-5554"), L"模拟器") == 0);
+    CHECK(wcscmp(dev_conn_text(L"adb-test._adb-tls-connect._tcp"), L"网络") == 0);
+    CHECK(wcscmp(dev_conn_text(L"adb-test (2)._adb-tls-connect._tcp"), L"网络") == 0);
+    puts("CLASSIFICATION USB=USB TCP=NETWORK MDNS=NETWORK MDNS2=NETWORK EMULATOR=EMULATOR");
+}
+
 int main(void)
 {
     test_attachment();
@@ -411,6 +421,7 @@ int main(void)
     test_wireless_disconnect();
     test_wireless_address();
     test_device_capture();
+    test_connection_classification();
     reset_state();
     puts("PASS all session regression tests");
     return 0;
