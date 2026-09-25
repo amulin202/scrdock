@@ -4,6 +4,42 @@
 static const wchar_t *test_mode;
 static int test_result = -1;
 static HWND original_manager;
+static ULONGLONG click_deadline;
+
+static VOID CALLBACK check_wireless_click(HWND hwnd, UINT msg, UINT_PTR id, DWORD time)
+{
+    (void) msg; (void) time;
+    bool success = wcscmp(g.tipStatus, L"已断开无线连接: 192.0.2.10:5555") == 0;
+    if (!success && GetTickCount64() < click_deadline) return;
+    test_result = success ? 0 : 11;
+    KillTimer(hwnd, id);
+    PostMessageW(hwnd, WM_CLOSE, 0, 0);
+}
+
+static int run_wireless_click(void)
+{
+    g_hInst = GetModuleHandleW(NULL);
+    INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES};
+    InitCommonControlsEx(&icc);
+    register_and_create();
+    g.adbOk = true;
+    GetModuleFileNameW(NULL, g.adbPath, MAX_PATH);
+    g.devList = calloc(1, sizeof(*g.devList));
+    if (!g.devList) return 12;
+    g.devList->count = 1;
+    wcscpy_s(g.devList->v[0].serial, 64, L"192.0.2.10:5555");
+    wcscpy_s(g.devList->v[0].state, 16, L"device");
+    mgr_open();
+    ListView_SetItemState(m.lv, 0, LVIS_SELECTED | LVIS_FOCUSED,
+                          LVIS_SELECTED | LVIS_FOCUSED);
+    click_deadline = GetTickCount64() + 2500;
+    SetTimer(g.hwnd, 901, 50, check_wireless_click);
+    /* Exercise BUTTON -> page WM_COMMAND -> manager -> worker -> result. */
+    SendMessageW(m.wifiDisconnect, BM_CLICK, 0, 0);
+    run_loop();
+    free(g.devList);
+    return test_result;
+}
 
 static VOID CALLBACK check_window_state(HWND hwnd, UINT msg, UINT_PTR id, DWORD time)
 {
@@ -27,6 +63,7 @@ static VOID CALLBACK check_window_state(HWND hwnd, UINT msg, UINT_PTR id, DWORD 
 
 static int run_case(const wchar_t *mode)
 {
+    if (wcscmp(mode, L"wireless-click") == 0) return run_wireless_click();
     test_mode = mode;
     g_hInst = GetModuleHandleW(NULL);
     INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES};
@@ -73,11 +110,15 @@ static int run_case(const wchar_t *mode)
 
 int wmain(int argc, wchar_t **argv)
 {
+    /* Stand in for adb in the click test; validate the exact endpoint. */
+    if (argc == 3 && wcscmp(argv[1], L"disconnect") == 0) {
+        return wcscmp(argv[2], L"192.0.2.10:5555") == 0 ? 0 : 13;
+    }
     if (argc == 2) return run_case(argv[1]);
     wchar_t exe[MAX_PATH];
     if (!GetModuleFileNameW(NULL, exe, MAX_PATH)) return 1;
     const wchar_t *cases[] = {L"empty", L"pending", L"lost", L"docked",
-                             L"activate-existing", L"activate-new"};
+                             L"activate-existing", L"activate-new", L"wireless-click"};
     int failures = 0;
     for (int i = 0; i < (int) (sizeof(cases) / sizeof(cases[0])); i++) {
         wchar_t cmd[MAX_PATH + 64];

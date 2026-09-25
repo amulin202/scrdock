@@ -4063,6 +4063,19 @@ static LRESULT CALLBACK mgr_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 InvalidateRect(g.hwnd, NULL, FALSE);
             }
             break;
+        case MID_WIFI_DISCONNECT:
+            {
+                wchar_t serial[64];
+                if (wifi_prepare_disconnect(mgr_selected_serial(serial, 64) ? serial : NULL)) {
+                    if (wifi_spawn_cmd(3, serial, NULL)) {
+                        swprintf(g.tipStatus, TIP_STATUS_LEN, L"正在断开无线连接: %s", serial);
+                    } else {
+                        wcscpy(g.tipStatus, L"启动断开任务失败，请重试");
+                    }
+                }
+                if (m.status) SetWindowTextW(m.status, g.tipStatus);
+            }
+            break;
         case MID_CHK_WIRELESS:
             g.cfg.wireless = ISCHK(m.chkWireless);
             ini_save();
@@ -4977,19 +4990,6 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
             mgr_refresh();
             InvalidateRect(hwnd, NULL, FALSE);
-            break;
-        case MID_WIFI_DISCONNECT:
-            {
-                wchar_t serial[64];
-                if (wifi_prepare_disconnect(mgr_selected_serial(serial, 64) ? serial : NULL)) {
-                    if (wifi_spawn_cmd(3, serial, NULL)) {
-                        swprintf(g.tipStatus, TIP_STATUS_LEN, L"正在断开无线连接: %s", serial);
-                    } else {
-                        wcscpy(g.tipStatus, L"启动断开任务失败，请重试");
-                    }
-                }
-                if (m.status) SetWindowTextW(m.status, g.tipStatus);
-            }
             break;
         case TIMER_BG_RECONN:
             ses_reconnect_background();
