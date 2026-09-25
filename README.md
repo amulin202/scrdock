@@ -147,7 +147,8 @@ build.bat D:\path\to\scrcpy\dist   :: 编译并复制到 scrcpy 目录
 零外部依赖：只链 user32/gdi32/kernel32/shell32/advapi32/comctl32/comdlg32。
 
 运行会话回归测试：`powershell -ExecutionPolicy Bypass -File tests\run.ps1`。
-测试直接调用生产状态机，模拟进程创建、窗口消息及定时器，不启动真实 ADB 或投屏。
+会话测试直接调用生产状态机并模拟进程与窗口边界；生命周期测试使用真实 Win32
+窗口和消息循环，覆盖管理器关闭、正常投屏保留及重复启动唤起。测试不启动真实 ADB 或投屏。
 
 ## 图标与资源
 
@@ -162,7 +163,8 @@ build.bat D:\path\to\scrcpy\dist   :: 编译并复制到 scrcpy 目录
 - 电源键（26）是真实电源键：会灭屏（镜像继续）
 - 单实例多会话：最多 4 路投屏同时运行，一个工具栏控制活动会话
 - ini 值为 ANSI；截图目录固定在 `Pictures\scrdock`
-- 同一时间只允许一个 scrdock 实例（互斥体）
+- 同一时间只允许一个 scrdock 实例（互斥体）；再次启动会唤起已有实例的管理器。
+  没有可用投屏窗口时关闭管理器会退出程序，正常投屏时只关闭管理器
 - 检测到多个 scrcpy.exe 时附着最新的那个；多设备时用管理窗口选择
   （拉起的 scrcpy 总是带 `-s <序列号>`，绝不连错设备）
 - 后台会话与活动会话均支持有次数限制的断线重连；后台重连不切换活动设备，

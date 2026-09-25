@@ -64,6 +64,7 @@
 #define WM_APP_WIFIDONE (WM_APP + 6)  /* wp: heap WifiResult*          */
 #define WM_APP_SESEXIT  (WM_APP + 7)  /* wp: session index, lp: exit code */
 #define WM_APP_QREVENT  (WM_APP + 8)  /* lp: owned struct QrEvent* */
+#define WM_APP_ACTIVATE (WM_APP + 9) /* another launch requests the manager */
 
 #define TIMER_HUNT  1  /* 200 ms: poll for the scrcpy window            */
 #define TIMER_SYNC  2  /* 500 ms: safety net (missed events, pid polls) */
@@ -4099,11 +4100,11 @@ static LRESULT CALLBACK mgr_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             DeleteObject(m.fontB);
         }
         ZeroMemory(&m, sizeof(m));
-        /* boot-failure state: the toolbar never docked and there is no
-         * scrcpy session left — closing the manager should not leave a
-         * hidden zombie holding the single-instance mutex */
-        if (g.hwnd && !g.everDocked && !g.hProc) {
-            DestroyWindow(g.hwnd);
+        /* A process handle is not a usable UI. Close the hidden owner when
+         * no mirror remains, but defer until this owned window has finished
+         * destruction: destroying the owner here re-enters window teardown. */
+        if (g.hwnd && !g.closing && (!g.target || !IsWindow(g.target))) {
+            PostMessageW(g.hwnd, WM_CLOSE, 0, 0);
         }
         return 0;
     default:
@@ -4696,6 +4697,12 @@ static void teardown(HWND hwnd)
 static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
+    case WM_APP_ACTIVATE:
+        if (!g.closing) {
+            mgr_open();
+            if (m.frame) SetForegroundWindow(m.frame);
+        }
+        return 0;
     case WM_CREATE:
         g.hwnd = hwnd;
         ensure_fonts(wnd_dpi(hwnd));
@@ -5223,6 +5230,15 @@ static void register_and_create(void)
                              NULL, NULL, g_hInst, NULL);
 }
 
+static void activate_instance_window(HWND hwnd)
+{
+    if (!hwnd) return;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid) AllowSetForegroundWindow(pid);
+    PostMessageW(hwnd, WM_APP_ACTIVATE, 0, 0);
+}
+
 int WINAPI wWinMain(HINSTANCE h_inst, HINSTANCE h_prev, PWSTR cmd_line,
                     int n_show)
 {
@@ -5241,6 +5257,7 @@ int WINAPI wWinMain(HINSTANCE h_inst, HINSTANCE h_prev, PWSTR cmd_line,
         return 1;
     }
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        activate_instance_window(FindWindowW(L"scrdock_cls", NULL));
         CloseHandle(hMutex);
         return 0;
     }

@@ -12,6 +12,11 @@ try {
     if ($LASTEXITCODE -ne 0) { throw '回归测试编译失败' }
     & '.\build\tests\test_sessions.exe'
     if ($LASTEXITCODE -ne 0) { throw '回归测试失败' }
+    $command = 'call "{0}" >nul 2>nul && cl /nologo /W4 /WX /O2 /utf-8 /D_CRT_SECURE_NO_WARNINGS /D_WIN32_WINNT=0x0A00 tests\test_lifecycle.c qrcodegen.c /Fe:build\tests\test_lifecycle.exe /Fo:build\tests\ /link /SUBSYSTEM:CONSOLE user32.lib gdi32.lib kernel32.lib shell32.lib advapi32.lib comctl32.lib comdlg32.lib' -f $vcvars
+    & $env:ComSpec /d /c $command
+    if ($LASTEXITCODE -ne 0) { throw '窗口生命周期测试编译失败' }
+    & '.\build\tests\test_lifecycle.exe'
+    if ($LASTEXITCODE -ne 0) { throw '窗口生命周期测试失败' }
 } finally {
     Pop-Location
 }
