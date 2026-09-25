@@ -16,6 +16,11 @@ static VOID CALLBACK check_window_state(HWND hwnd, UINT msg, UINT_PTR id, DWORD 
         if (wcscmp(test_mode, L"activate-existing") == 0 && m.frame != original_manager) {
             test_result = 8;
         }
+        if (wcscmp(test_mode, L"activate-new") == 0
+                && (!IsWindow(m.wifiDisconnect)
+                    || GetDlgCtrlID(m.wifiDisconnect) != MID_WIFI_DISCONNECT)) {
+            test_result = 10;
+        }
     }
     PostMessageW(g.hwnd, WM_CLOSE, 0, 0);
 }

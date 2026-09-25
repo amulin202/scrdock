@@ -2206,7 +2206,8 @@ enum {
     MID_OPT_SAVE,
     MID_SCRCPY_ED, MID_SCRCPY_BR, MID_ADB_ED, MID_ADB_BR,
     MID_DETECT, MID_PATH_SAVE,
-    MID_PAIR_ADDR, MID_PAIR_CODE, MID_PAIR_GO, MID_PAIR_QR_REFRESH
+    MID_PAIR_ADDR, MID_PAIR_CODE, MID_PAIR_GO, MID_PAIR_QR_REFRESH,
+    MID_WIFI_DISCONNECT
 };
 
 static struct {
@@ -2217,7 +2218,7 @@ static struct {
     RECT closeRc;               /* self-drawn close cell in the header    */
     HWND page[MPAGE_COUNT];
     HWND lv, refresh, connect, remember, disconnect, status, errview;
-    HWND chkWireless, wifiEd, wifiGo, pairBtn;
+    HWND chkWireless, wifiEd, wifiGo, pairBtn, wifiDisconnect;
     HWND bitrate, maxsize, maxfps, chkScreenOff, chkStayAwake, chkNoAudio,
          chkTouch, chkReconn, reconnN, chkCloseExit, extra, optSave;
     HWND scrcpyEd, scrcpyBr, adbEd, adbBr, detect, pathSave, detectOut;
@@ -2769,14 +2770,16 @@ static void mgr_create_dev_page(HWND page, UINT dpi)
     ListView_SetTextColor(m.lv, RGB(235, 235, 235));
     mgr_add_lv_columns(m.lv);
 
-    m.refresh = mgr_button(page, dpi, L"刷新", 0, 232, 90, MID_REFRESH);
-    m.connect = mgr_button(page, dpi, L"连接所选", 102, 232, 120,
+    m.refresh = mgr_button(page, dpi, L"刷新", 0, 232, 64, MID_REFRESH);
+    m.connect = mgr_button(page, dpi, L"连接所选", 76, 232, 100,
                            MID_CONNECT);
-    m.disconnect = mgr_button(page, dpi, L"断开", 234, 232, 90,
+    m.disconnect = mgr_button(page, dpi, L"断开投屏", 188, 232, 82,
                               MID_DISCONNECT);
+    m.wifiDisconnect = mgr_button(page, dpi, L"断开无线", 282, 232, 100,
+                                  MID_WIFI_DISCONNECT);
     /* same height as the buttons so the row has one baseline */
     m.remember = mkctl(page, L"BUTTON", BS_AUTOCHECKBOX | WS_TABSTOP,
-                       L"记住此设备 (serial=)", 336, 232, 216,
+                       L"记住此设备", 394, 232, 166,
                        MG_BTN_H_96, MID_REMEMBER, dpi);
     SendMessageW(m.remember, BM_SETCHECK,
                  g.cfg.serial[0] ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -2919,7 +2922,9 @@ static void mgr_show_page(int idx)
 /* ---- adb connect / adb pair / mdns discovery (worker) ---- */
 
 struct WifiWork {
-    int mode;                /* 0 = connect, 1 = pair, 2 = discover only  */
+    int mode;                /* 0 = connect, 1 = pair, 2 = discover, 3 = disconnect */
+    wchar_t adb[MAX_PATH];   /* snapshot for selected-device disconnect */
+    HWND hwnd;
     wchar_t a[80];           /* address (connect: ip[:port], pair: ip:port) */
     wchar_t b[16];           /* pairing code                            */
 };
@@ -3108,6 +3113,40 @@ static void mdns_discover_and_connect(struct WifiResult *r)
     wifi_append(r, addrs[0]);
 }
 
+static bool wifi_prepare_disconnect(const wchar_t *serial)
+{
+    if (!serial || !serial[0]) {
+        wcscpy(g.tipStatus, L"请先在设备列表中选中要断开的无线设备");
+        return false;
+    }
+    if (!wcschr(serial, L':') && !wcsstr(serial, L"._adb-tls-connect._tcp")) {
+        wcscpy(g.tipStatus, L"所选设备不是无线连接，USB 投屏请使用“断开投屏”");
+        return false;
+    }
+    if (!g.adbOk) {
+        wcscpy(g.tipStatus, L"未找到 adb，请先在路径页设置 adb.exe");
+        return false;
+    }
+    /* Cancel this session's retries before adb reports it as offline. */
+    if (ses_find(serial) >= 0) ses_disconnect_selected(serial);
+    if (g.bootLaunch && wcscmp(g.serial, serial) == 0) g.bootLaunch = false;
+    return true;
+}
+
+static void wifi_disconnect_run(const struct WifiWork *w, struct WifiResult *r)
+{
+    wchar_t cmd[MAX_PATH + 200];
+    char out[512];
+    DWORD ec = (DWORD) -1;
+    swprintf(cmd, MAX_PATH + 200, L"\"%s\" disconnect \"%s\"", w->adb, w->a);
+    bool ok = capture_sync(cmd, out, sizeof(out), 10000, &ec) && ec == 0;
+    if (ok) {
+        swprintf(r->text, 256, L"已断开无线连接: %s", w->a);
+    } else {
+        swprintf(r->text, 256, L"断开无线失败: %s（code %lu），请刷新后重试", w->a, ec);
+    }
+}
+
 static unsigned __stdcall wifi_cmd_thread(void *arg)
 {
     struct WifiWork *w = (struct WifiWork *) arg;
@@ -3116,7 +3155,9 @@ static unsigned __stdcall wifi_cmd_thread(void *arg)
     char out[512];
     DWORD ec = 1;
 
-    if (r) {
+    if (r && w->mode == 3) {
+        wifi_disconnect_run(w, r);
+    } else if (r) {
         r->pair = (w->mode == 1);
         if (w->mode == 1) {
             swprintf(cmd, MAX_PATH + 200, L"\"%s\" pair %s %s",
@@ -3151,22 +3192,23 @@ static unsigned __stdcall wifi_cmd_thread(void *arg)
             mdns_discover_and_connect(r);
         }
     }
+    HWND hwnd = w->hwnd;
     free(w);
-    if (g.hwnd) {
-        PostMessageW(g.hwnd, WM_APP_WIFIDONE, (WPARAM) r, 0);
-    } else {
+    if (!hwnd || !PostMessageW(hwnd, WM_APP_WIFIDONE, (WPARAM) r, 0)) {
         free(r);
     }
     return 0;
 }
 
-static void wifi_spawn_cmd(int mode, const wchar_t *a, const wchar_t *b)
+static bool wifi_spawn_cmd(int mode, const wchar_t *a, const wchar_t *b)
 {
     struct WifiWork *w = calloc(1, sizeof(*w));
     if (!w) {
-        return;
+        return false;
     }
     w->mode = mode;
+    w->hwnd = g.hwnd;
+    wcscpy_s(w->adb, MAX_PATH, g.adbPath);
     if (a) {
         wcsncpy(w->a, a, 79);
     }
@@ -3176,8 +3218,10 @@ static void wifi_spawn_cmd(int mode, const wchar_t *a, const wchar_t *b)
     uintptr_t th = _beginthreadex(NULL, 0, wifi_cmd_thread, w, 0, NULL);
     if (th) {
         CloseHandle((HANDLE) th);
+        return true;
     } else {
         free(w);
+        return false;
     }
 }
 
@@ -4933,6 +4977,19 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
             mgr_refresh();
             InvalidateRect(hwnd, NULL, FALSE);
+            break;
+        case MID_WIFI_DISCONNECT:
+            {
+                wchar_t serial[64];
+                if (wifi_prepare_disconnect(mgr_selected_serial(serial, 64) ? serial : NULL)) {
+                    if (wifi_spawn_cmd(3, serial, NULL)) {
+                        swprintf(g.tipStatus, TIP_STATUS_LEN, L"正在断开无线连接: %s", serial);
+                    } else {
+                        wcscpy(g.tipStatus, L"启动断开任务失败，请重试");
+                    }
+                }
+                if (m.status) SetWindowTextW(m.status, g.tipStatus);
+            }
             break;
         case TIMER_BG_RECONN:
             ses_reconnect_background();

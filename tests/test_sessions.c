@@ -11,6 +11,10 @@
 static bool timers[16], fail_launch;
 static int launches, posted;
 static wchar_t last_command[2048];
+static DWORD process_exit_code;
+
+static BOOL WINAPI fake_exit_code(HANDLE process, LPDWORD code)
+{ (void) process; *code = process_exit_code; return TRUE; }
 
 static UINT_PTR WINAPI fake_set_timer(HWND h, UINT_PTR id, UINT ms, TIMERPROC cb)
 {
@@ -61,6 +65,7 @@ static HWINEVENTHOOK WINAPI fake_hook(DWORD first, DWORD last, HMODULE module,
 #define SetTimer fake_set_timer
 #define KillTimer fake_kill_timer
 #define CreateProcessW fake_create_process
+#define GetExitCodeProcess fake_exit_code
 #define PostMessageW fake_post
 #define InvalidateRect fake_invalidate
 #define IsWindow fake_is_window
@@ -89,6 +94,7 @@ static void reset_state(void)
     wcscpy_s(g.scrcpyPath, MAX_PATH, L"scrcpy.exe");
     fail_launch = false;
     launches = posted = 0;
+    process_exit_code = 0;
     last_command[0] = L'\0';
 }
 
@@ -304,6 +310,40 @@ static void test_launch_preserves_sessions(void)
     puts("PASS launch transitions: failure preserves active handles; new session retains old pending retry");
 }
 
+static void test_wireless_disconnect(void)
+{
+    reset_state();
+    session(0, L"USB-A", true);
+    HANDLE active = g.hProc;
+    g.adbOk = true;
+    CHECK(!wifi_prepare_disconnect(NULL));
+    CHECK(!wifi_prepare_disconnect(L"USB-A"));
+    CHECK(g.hProc == active && g_active == 0);
+    session(1, L"192.0.2.10:5555", false);
+    g_ses[1].reconnPending = true;
+    CHECK(wifi_prepare_disconnect(L"192.0.2.10:5555"));
+    CHECK(!g_ses[1].used && g.hProc == active && g_active == 0);
+    CHECK(wifi_prepare_disconnect(L"adb-test._adb-tls-connect._tcp"));
+    g.adbOk = false;
+    CHECK(!wifi_prepare_disconnect(L"192.0.2.10:5555"));
+
+    struct WifiWork w = {0};
+    struct WifiResult r = {0};
+    wcscpy_s(w.adb, MAX_PATH, L"C:\\ADB Tools\\adb.exe");
+    wcscpy_s(w.a, 80, L"192.0.2.10:5555");
+    wifi_disconnect_run(&w, &r);
+    CHECK(wcscmp(last_command, L"\"C:\\ADB Tools\\adb.exe\" disconnect \"192.0.2.10:5555\"") == 0);
+    CHECK(wcsstr(r.text, L"已断开无线连接") != NULL);
+    CHECK(g.hProc == active && g_active == 0);
+    process_exit_code = 1;
+    wifi_disconnect_run(&w, &r);
+    CHECK(wcsstr(r.text, L"断开无线失败") != NULL);
+    fail_launch = true;
+    wifi_disconnect_run(&w, &r);
+    CHECK(wcsstr(r.text, L"断开无线失败") != NULL);
+    puts("PASS wireless disconnect: selected endpoint only, cancel retries, reject USB, report failures");
+}
+
 int main(void)
 {
     test_attachment();
@@ -314,6 +354,7 @@ int main(void)
     test_switch_pending();
     test_wifi_reconnect();
     test_launch_preserves_sessions();
+    test_wireless_disconnect();
     reset_state();
     puts("PASS all session regression tests");
     return 0;
