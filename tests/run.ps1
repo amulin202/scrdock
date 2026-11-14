@@ -7,17 +7,27 @@ $vcvars = Join-Path $installation 'VC\Auxiliary\Build\vcvars64.bat'
 Push-Location $root
 try {
     New-Item -ItemType Directory -Force 'build\tests' | Out-Null
-    $command = 'call "{0}" >nul 2>nul && cl /nologo /W4 /WX /O2 /utf-8 /D_CRT_SECURE_NO_WARNINGS /D_WIN32_WINNT=0x0A00 tests\test_sessions.c qrcodegen.c /Fe:build\tests\test_sessions.exe /Fo:build\tests\ /link /SUBSYSTEM:CONSOLE user32.lib gdi32.lib kernel32.lib shell32.lib advapi32.lib comctl32.lib comdlg32.lib' -f $vcvars
+    $command = 'call "{0}" >nul 2>nul && cl /nologo /W4 /WX /O2 /utf-8 /D_CRT_SECURE_NO_WARNINGS /D_WIN32_WINNT=0x0A00 tests\test_config_store.c config_store.c /Fe:build\tests\test_config_store.exe /Fo:build\tests\ /link /SUBSYSTEM:CONSOLE kernel32.lib' -f $vcvars
+    & $env:ComSpec /d /c $command
+    if ($LASTEXITCODE -ne 0) { throw '配置存储测试编译失败' }
+    & '.\build\tests\test_config_store.exe'
+    if ($LASTEXITCODE -ne 0) { throw '配置存储测试失败' }
+    $command = 'call "{0}" >nul 2>nul && cl /nologo /W4 /WX /O2 /utf-8 /D_CRT_SECURE_NO_WARNINGS /D_WIN32_WINNT=0x0A00 tests\test_state.c state.c /Fe:build\tests\test_state.exe /Fo:build\tests\ /link /SUBSYSTEM:CONSOLE kernel32.lib' -f $vcvars
+    & $env:ComSpec /d /c $command
+    if ($LASTEXITCODE -ne 0) { throw '状态模块测试编译失败' }
+    & '.\build\tests\test_state.exe'
+    if ($LASTEXITCODE -ne 0) { throw '状态模块测试失败' }
+    $command = 'call "{0}" >nul 2>nul && cl /nologo /W4 /WX /O2 /utf-8 /D_CRT_SECURE_NO_WARNINGS /D_WIN32_WINNT=0x0A00 tests\test_sessions.c config_store.c state.c qrcodegen.c /Fe:build\tests\test_sessions.exe /Fo:build\tests\ /link /SUBSYSTEM:CONSOLE user32.lib gdi32.lib kernel32.lib shell32.lib advapi32.lib comctl32.lib comdlg32.lib' -f $vcvars
     & $env:ComSpec /d /c $command
     if ($LASTEXITCODE -ne 0) { throw '回归测试编译失败' }
     & '.\build\tests\test_sessions.exe'
     if ($LASTEXITCODE -ne 0) { throw '回归测试失败' }
-    $command = 'call "{0}" >nul 2>nul && cl /nologo /W4 /WX /O2 /utf-8 /D_CRT_SECURE_NO_WARNINGS /D_WIN32_WINNT=0x0A00 tests\test_lifecycle.c qrcodegen.c /Fe:build\tests\test_lifecycle.exe /Fo:build\tests\ /link /SUBSYSTEM:CONSOLE user32.lib gdi32.lib kernel32.lib shell32.lib advapi32.lib comctl32.lib comdlg32.lib' -f $vcvars
+    $command = 'call "{0}" >nul 2>nul && cl /nologo /W4 /WX /O2 /utf-8 /D_CRT_SECURE_NO_WARNINGS /D_WIN32_WINNT=0x0A00 tests\test_lifecycle.c config_store.c state.c qrcodegen.c /Fe:build\tests\test_lifecycle.exe /Fo:build\tests\ /link /SUBSYSTEM:CONSOLE user32.lib gdi32.lib kernel32.lib shell32.lib advapi32.lib comctl32.lib comdlg32.lib' -f $vcvars
     & $env:ComSpec /d /c $command
     if ($LASTEXITCODE -ne 0) { throw '窗口生命周期测试编译失败' }
     & '.\build\tests\test_lifecycle.exe'
     if ($LASTEXITCODE -ne 0) { throw '窗口生命周期测试失败' }
-    $command = 'call "{0}" >nul 2>nul && cl /nologo /W4 /WX /O2 /utf-8 /D_CRT_SECURE_NO_WARNINGS /D_WIN32_WINNT=0x0A00 tests\test_pairing.c qrcodegen.c /Fe:build\tests\test_pairing.exe /Fo:build\tests\ /link /SUBSYSTEM:CONSOLE user32.lib gdi32.lib kernel32.lib shell32.lib advapi32.lib comctl32.lib comdlg32.lib' -f $vcvars
+    $command = 'call "{0}" >nul 2>nul && cl /nologo /W4 /WX /O2 /utf-8 /D_CRT_SECURE_NO_WARNINGS /D_WIN32_WINNT=0x0A00 tests\test_pairing.c config_store.c state.c qrcodegen.c /Fe:build\tests\test_pairing.exe /Fo:build\tests\ /link /SUBSYSTEM:CONSOLE user32.lib gdi32.lib kernel32.lib shell32.lib advapi32.lib comctl32.lib comdlg32.lib' -f $vcvars
     & $env:ComSpec /d /c $command
     if ($LASTEXITCODE -ne 0) { throw '二维码配对测试编译失败' }
     & '.\build\tests\test_pairing.exe'

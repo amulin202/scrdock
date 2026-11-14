@@ -52,6 +52,8 @@
 #include <commdlg.h>
 #include <wincrypt.h>
 #include "qrcodegen.h"
+#include "config_store.h"
+#include "state.h"
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "comdlg32.lib")
@@ -65,6 +67,7 @@
 #define WM_APP_SESEXIT  (WM_APP + 7)  /* wp: session index, lp: exit code */
 #define WM_APP_QREVENT  (WM_APP + 8)  /* lp: owned struct QrEvent* */
 #define WM_APP_ACTIVATE (WM_APP + 9) /* another launch requests the manager */
+#define WM_APP_DEVSTALE (WM_APP + 10) /* wp: last probe error code */
 
 #define TIMER_HUNT  1  /* 200 ms: poll for the scrcpy window            */
 #define TIMER_SYNC  2  /* 500 ms: safety net (missed events, pid polls) */
@@ -219,6 +222,8 @@ struct Scrdock {
     int w, h;               /* window size (dpi-scaled)             */
     RECT lastDock;          /* dedupe                               */
     struct Config cfg;
+    ScrdockSnapshotState state_snapshot;
+    ScrdockSessionTable state_sessions;
 };
 
 static struct Scrdock g;
@@ -317,6 +322,17 @@ static bool dev_online(const wchar_t *serial);
 static void reconn_arm(void);
 static void ses_become_active(int idx);
 static bool ses_disconnect_selected(const wchar_t *serial);
+static const wchar_t *wifi_ip_of(const wchar_t *serial);
+static const wchar_t *wifi_serial_of_ip(const wchar_t *ip);
+static bool state_ids_for_serial(const wchar_t *serial,
+                                 wchar_t *device_id, size_t device_id_cch,
+                                 wchar_t *connection_id, size_t connection_id_cch);
+static void state_session_begin_for_serial(const wchar_t *serial,
+                                           const wchar_t *command,
+                                           uint64_t started_at);
+static void state_session_finish_for_serial(const wchar_t *serial,
+                                            int exit_code,
+                                            uint64_t ended_at);
 
 /* ------------------------------------------------------------------ */
 /* small utilities                                                     */
@@ -396,127 +412,74 @@ static bool find_tool(const wchar_t *name, const wchar_t *extra_dir,
     return false;
 }
 
+static void config_path(wchar_t out[MAX_PATH])
+{
+    swprintf(out, MAX_PATH, L"%s\\scrdock.ini", g.exeDir);
+}
+
 static void ini_load(void)
 {
     wchar_t ini[MAX_PATH];
-    char ini_a[MAX_PATH];
-    char buf[1024];
-    swprintf(ini, MAX_PATH, L"%s\\scrdock.ini", g.exeDir);
+    struct ConfigStore stored;
+    bool migrate = false;
 
-    g.cfg.serial[0] = L'\0';
-    g.cfg.scrcpy[0] = L'\0';
-    g.cfg.scrcpy_args[0] = L'\0';
-    g.cfg.adb[0] = L'\0';
-    g.cfg.close_on_exit = TRUE;
-    g.cfg.control = 0;
-    g.cfg.bitrate = 0;
-    g.cfg.max_size = 0;
-    g.cfg.max_fps = 0;
-    g.cfg.turn_screen_off = FALSE;
-    g.cfg.stay_awake = FALSE;
-    g.cfg.no_audio = FALSE;
-    g.cfg.show_touches = FALSE;
-    g.cfg.auto_reconnect = TRUE;
-    g.cfg.reconnect_attempts = 5;
-    g.cfg.wireless = FALSE;
-
-    if (!file_exists(ini)) {
-        return;
+    config_path(ini);
+    if (!config_store_load(ini, &stored, &migrate)) {
+        config_store_defaults(&stored);
+        dbg_log(L"config: load failed, using defaults (%lu)\n", GetLastError());
     }
-    WideCharToMultiByte(CP_ACP, 0, ini, -1, ini_a, MAX_PATH, NULL, NULL);
-
-    GetPrivateProfileStringA("scrdock", "serial", "", buf, sizeof(buf), ini_a);
-    MultiByteToWideChar(CP_ACP, 0, buf, -1, g.cfg.serial, 128);
-    GetPrivateProfileStringA("scrdock", "scrcpy_args", "", buf, sizeof(buf), ini_a);
-    MultiByteToWideChar(CP_ACP, 0, buf, -1, g.cfg.scrcpy_args, 512);
-    GetPrivateProfileStringA("scrdock", "adb", "", buf, sizeof(buf), ini_a);
-    MultiByteToWideChar(CP_ACP, 0, buf, -1, g.cfg.adb, MAX_PATH);
-    g.cfg.close_on_exit =
-        GetPrivateProfileIntA("scrdock", "close_scrcpy_on_exit", 1, ini_a) != 0;
-    {
-        char ctl[16];
-        GetPrivateProfileStringA("scrdock", "control", "auto", ctl, sizeof(ctl), ini_a);
-        if (_stricmp(ctl, "shortcut") == 0) {
-            g.cfg.control = 1;
-        } else if (_stricmp(ctl, "adb") == 0) {
-            g.cfg.control = 2;
-        } else {
-            g.cfg.control = 0;
-        }
+    wcsncpy_s(g.cfg.serial, _countof(g.cfg.serial), stored.serial, _TRUNCATE);
+    wcsncpy_s(g.cfg.scrcpy, _countof(g.cfg.scrcpy), stored.scrcpy, _TRUNCATE);
+    wcsncpy_s(g.cfg.scrcpy_args, _countof(g.cfg.scrcpy_args),
+              stored.scrcpy_args, _TRUNCATE);
+    wcsncpy_s(g.cfg.adb, _countof(g.cfg.adb), stored.adb, _TRUNCATE);
+    g.cfg.close_on_exit = stored.close_on_exit;
+    g.cfg.control = stored.control;
+    g.cfg.bitrate = stored.bitrate;
+    g.cfg.max_size = stored.max_size;
+    g.cfg.max_fps = stored.max_fps;
+    g.cfg.turn_screen_off = stored.turn_screen_off;
+    g.cfg.stay_awake = stored.stay_awake;
+    g.cfg.no_audio = stored.no_audio;
+    g.cfg.show_touches = stored.show_touches;
+    g.cfg.auto_reconnect = stored.auto_reconnect;
+    g.cfg.reconnect_attempts = stored.reconnect_attempts;
+    g.cfg.wireless = stored.wireless;
+    if (migrate && !config_store_save_atomic(ini, &stored)) {
+        dbg_log(L"config: migration save failed (%lu)\n", GetLastError());
     }
-    GetPrivateProfileStringA("scrdock", "scrcpy", "", buf, sizeof(buf), ini_a);
-    MultiByteToWideChar(CP_ACP, 0, buf, -1, g.cfg.scrcpy, MAX_PATH);
-    g.cfg.bitrate = GetPrivateProfileIntA("scrdock", "bitrate", 0, ini_a);
-    g.cfg.max_size = GetPrivateProfileIntA("scrdock", "max_size", 0, ini_a);
-    g.cfg.max_fps = GetPrivateProfileIntA("scrdock", "max_fps", 0, ini_a);
-    g.cfg.turn_screen_off =
-        GetPrivateProfileIntA("scrdock", "turn_screen_off", 0, ini_a) != 0;
-    g.cfg.stay_awake =
-        GetPrivateProfileIntA("scrdock", "stay_awake", 0, ini_a) != 0;
-    g.cfg.no_audio =
-        GetPrivateProfileIntA("scrdock", "no_audio", 0, ini_a) != 0;
-    g.cfg.show_touches =
-        GetPrivateProfileIntA("scrdock", "show_touches", 0, ini_a) != 0;
-    g.cfg.auto_reconnect =
-        GetPrivateProfileIntA("scrdock", "auto_reconnect", 1, ini_a) != 0;
-    g.cfg.reconnect_attempts =
-        GetPrivateProfileIntA("scrdock", "reconnect_attempts", 5, ini_a);
-    g.cfg.wireless =
-        GetPrivateProfileIntA("scrdock", "wireless", 0, ini_a) != 0;
 }
 
 /* Persist the config. Called on the UI thread only (manager buttons and
- * device selection). Empty values remove the key, so a fresh ini keeps
- * exactly the non-default settings. */
+ * device selection). The store writes a complete versioned snapshot and
+ * atomically replaces the old file. */
 static void ini_save(void)
 {
     wchar_t ini[MAX_PATH];
-    char ini_a[MAX_PATH];
-    char val[1100];
+    struct ConfigStore stored;
 
-    swprintf(ini, MAX_PATH, L"%s\\scrdock.ini", g.exeDir);
-    WideCharToMultiByte(CP_ACP, 0, ini, -1, ini_a, MAX_PATH, NULL, NULL);
-
-    WideCharToMultiByte(CP_ACP, 0, g.cfg.serial, -1, val, 128, NULL, NULL);
-    WritePrivateProfileStringA("scrdock", "serial",
-                               g.cfg.serial[0] ? val : NULL, ini_a);
-    WideCharToMultiByte(CP_ACP, 0, g.cfg.scrcpy, -1, val, sizeof(val), NULL, NULL);
-    WritePrivateProfileStringA("scrdock", "scrcpy",
-                               g.cfg.scrcpy[0] ? val : NULL, ini_a);
-    WideCharToMultiByte(CP_ACP, 0, g.cfg.scrcpy_args, -1, val, sizeof(val), NULL, NULL);
-    WritePrivateProfileStringA("scrdock", "scrcpy_args",
-                               g.cfg.scrcpy_args[0] ? val : NULL, ini_a);
-    WideCharToMultiByte(CP_ACP, 0, g.cfg.adb, -1, val, sizeof(val), NULL, NULL);
-    WritePrivateProfileStringA("scrdock", "adb",
-                               g.cfg.adb[0] ? val : NULL, ini_a);
-    WritePrivateProfileStringA("scrdock", "close_scrcpy_on_exit",
-                               g.cfg.close_on_exit ? "1" : "0", ini_a);
-    const char *ctl = (g.cfg.control == 1) ? "shortcut"
-                    : (g.cfg.control == 2) ? "adb" : "auto";
-    WritePrivateProfileStringA("scrdock", "control", ctl, ini_a);
-    _itoa(g.cfg.bitrate, val, 10);
-    WritePrivateProfileStringA("scrdock", "bitrate",
-                               g.cfg.bitrate > 0 ? val : NULL, ini_a);
-    _itoa(g.cfg.max_size, val, 10);
-    WritePrivateProfileStringA("scrdock", "max_size",
-                               g.cfg.max_size > 0 ? val : NULL, ini_a);
-    _itoa(g.cfg.max_fps, val, 10);
-    WritePrivateProfileStringA("scrdock", "max_fps",
-                               g.cfg.max_fps > 0 ? val : NULL, ini_a);
-    WritePrivateProfileStringA("scrdock", "turn_screen_off",
-                               g.cfg.turn_screen_off ? "1" : NULL, ini_a);
-    WritePrivateProfileStringA("scrdock", "stay_awake",
-                               g.cfg.stay_awake ? "1" : NULL, ini_a);
-    WritePrivateProfileStringA("scrdock", "no_audio",
-                               g.cfg.no_audio ? "1" : NULL, ini_a);
-    WritePrivateProfileStringA("scrdock", "show_touches",
-                               g.cfg.show_touches ? "1" : NULL, ini_a);
-    WritePrivateProfileStringA("scrdock", "auto_reconnect",
-                               g.cfg.auto_reconnect ? "1" : "0", ini_a);
-    _itoa(g.cfg.reconnect_attempts, val, 10);
-    WritePrivateProfileStringA("scrdock", "reconnect_attempts", val, ini_a);
-    WritePrivateProfileStringA("scrdock", "wireless",
-                               g.cfg.wireless ? "1" : NULL, ini_a);
+    config_path(ini);
+    config_store_defaults(&stored);
+    wcsncpy_s(stored.serial, _countof(stored.serial), g.cfg.serial, _TRUNCATE);
+    wcsncpy_s(stored.scrcpy, _countof(stored.scrcpy), g.cfg.scrcpy, _TRUNCATE);
+    wcsncpy_s(stored.scrcpy_args, _countof(stored.scrcpy_args),
+              g.cfg.scrcpy_args, _TRUNCATE);
+    wcsncpy_s(stored.adb, _countof(stored.adb), g.cfg.adb, _TRUNCATE);
+    stored.close_on_exit = g.cfg.close_on_exit;
+    stored.control = g.cfg.control;
+    stored.bitrate = g.cfg.bitrate;
+    stored.max_size = g.cfg.max_size;
+    stored.max_fps = g.cfg.max_fps;
+    stored.turn_screen_off = g.cfg.turn_screen_off;
+    stored.stay_awake = g.cfg.stay_awake;
+    stored.no_audio = g.cfg.no_audio;
+    stored.show_touches = g.cfg.show_touches;
+    stored.auto_reconnect = g.cfg.auto_reconnect;
+    stored.reconnect_attempts = g.cfg.reconnect_attempts;
+    stored.wireless = g.cfg.wireless;
+    if (!config_store_save_atomic(ini, &stored)) {
+        dbg_log(L"config: atomic save failed (%lu)\n", GetLastError());
+    }
 }
 
 static UINT wnd_dpi(HWND hwnd)
@@ -782,6 +745,7 @@ static bool launch_scrcpy_ex(const wchar_t *serial, bool activate)
     slot->pinned_mod = pinned_mod;
     slot->stopRequested = false;
     slot->target = NULL;
+    state_session_begin_for_serial(serial, cmd, (uint64_t)slot->launchTick);
 
     if (activate) {
         g.hErr = rd;
@@ -1316,6 +1280,7 @@ static unsigned __stdcall track_thread(void *arg)
     (void) arg;
     struct DevList last;
     bool have_last = false;
+    bool stale_posted = false;
     wchar_t cmd[MAX_PATH + 32];
     char buf[2048];
     DWORD ec = 0;
@@ -1326,6 +1291,7 @@ static unsigned __stdcall track_thread(void *arg)
         struct DevList dl;
         if (capture_sync_cancel(cmd, buf, sizeof(buf), 10000, &ec, g.trackStop)
                 && ec == 0 && devlist_parse(buf, &dl)) {
+            stale_posted = false;
             if (!have_last || memcmp(&last, &dl, sizeof(dl)) != 0) {
                 struct DevList *heap_dl = malloc(sizeof(*heap_dl));
                 if (heap_dl) {
@@ -1337,6 +1303,15 @@ static unsigned __stdcall track_thread(void *arg)
                         free(heap_dl);
                     }
                 }
+            }
+        } else if (!stale_posted
+                   && (!g.trackStop
+                       || WaitForSingleObject(g.trackStop, 0) != WAIT_OBJECT_0)) {
+            DWORD error = ec ? ec : GetLastError();
+            if (error == 0) error = ERROR_GEN_FAILURE;
+            stale_posted = true;
+            if (g.hwnd) {
+                PostMessageW(g.hwnd, WM_APP_DEVSTALE, (WPARAM)error, 0);
             }
         }
         if (g.trackStop
@@ -1470,30 +1445,28 @@ static struct WifiMap g_wifiMap[DEV_MAX];
 
 static void wifi_map_load(void)
 {
-    char buf[4096];
+    wchar_t buf[4096];
     wchar_t ini[MAX_PATH];
-    char ini_a[MAX_PATH];
     swprintf(ini, MAX_PATH, L"%s\\scrdock.ini", g.exeDir);
-    WideCharToMultiByte(CP_ACP, 0, ini, -1, ini_a, MAX_PATH, NULL, NULL);
     if (!file_exists(ini)) {
         return;
     }
     ZeroMemory(buf, sizeof(buf));
-    GetPrivateProfileSectionA("devices", buf, sizeof(buf), ini_a);
-    char *p = buf;
+    GetPrivateProfileSectionW(L"devices", buf, _countof(buf), ini);
+    wchar_t *p = buf;
     int n = 0;
     while (*p && n < DEV_MAX) {
-        char *eq = strchr(p, '=');
+        wchar_t *eq = wcschr(p, L'=');
         if (eq) {
-            *eq = '\0';
-            MultiByteToWideChar(CP_ACP, 0, p, -1,
-                                g_wifiMap[n].serial, 64);
-            MultiByteToWideChar(CP_ACP, 0, eq + 1, -1,
-                                g_wifiMap[n].ip, 24);
+            *eq = L'\0';
+            wcsncpy_s(g_wifiMap[n].serial, _countof(g_wifiMap[n].serial),
+                      p, _TRUNCATE);
+            wcsncpy_s(g_wifiMap[n].ip, _countof(g_wifiMap[n].ip),
+                      eq + 1, _TRUNCATE);
             n++;
-            *eq = '=';
+            *eq = L'=';
         }
-        p += strlen(p) + 1;
+        p += wcslen(p) + 1;
     }
 }
 
@@ -1522,13 +1495,8 @@ static void wifi_map_set(const wchar_t *serial, const wchar_t *ip)
         }
     }
     wchar_t ini[MAX_PATH];
-    char ini_a[MAX_PATH];
-    char s_a[64], i_a[24];
     swprintf(ini, MAX_PATH, L"%s\\scrdock.ini", g.exeDir);
-    WideCharToMultiByte(CP_ACP, 0, ini, -1, ini_a, MAX_PATH, NULL, NULL);
-    WideCharToMultiByte(CP_ACP, 0, serial, -1, s_a, sizeof(s_a), NULL, NULL);
-    WideCharToMultiByte(CP_ACP, 0, ip, -1, i_a, sizeof(i_a), NULL, NULL);
-    WritePrivateProfileStringA("devices", s_a, i_a, ini_a);
+    WritePrivateProfileStringW(L"devices", serial, ip, ini);
 }
 
 static const wchar_t *wifi_ip_of(const wchar_t *serial)
@@ -1538,6 +1506,21 @@ static const wchar_t *wifi_ip_of(const wchar_t *serial)
         if (g_wifiMap[i].serial[0]
                 && wcscmp(g_wifiMap[i].serial, serial) == 0) {
             return g_wifiMap[i].ip;
+        }
+    }
+    return NULL;
+}
+
+static const wchar_t *wifi_serial_of_ip(const wchar_t *ip)
+{
+    int i;
+    if (!ip || !ip[0]) {
+        return NULL;
+    }
+    for (i = 0; i < DEV_MAX; i++) {
+        if (g_wifiMap[i].serial[0]
+                && wcscmp(g_wifiMap[i].ip, ip) == 0) {
+            return g_wifiMap[i].serial;
         }
     }
     return NULL;
@@ -1559,6 +1542,94 @@ static const wchar_t *wifi_serial_in_list(const wchar_t *usb_serial)
         }
     }
     return NULL;
+}
+
+static bool split_wifi_serial(const wchar_t *serial,
+                              wchar_t *ip, size_t ip_cch,
+                              unsigned short *port)
+{
+    const wchar_t *colon;
+    unsigned long value;
+    size_t len;
+
+    if (!serial || !ip || ip_cch == 0 || !port) {
+        return false;
+    }
+    colon = wcsrchr(serial, L':');
+    if (!colon || colon == serial || !colon[1]) {
+        return false;
+    }
+    value = wcstoul(colon + 1, NULL, 10);
+    if (value == 0 || value > 65535) {
+        return false;
+    }
+    len = (size_t)(colon - serial);
+    if (len >= ip_cch) {
+        return false;
+    }
+    wmemcpy(ip, serial, len);
+    ip[len] = L'\0';
+    *port = (unsigned short)value;
+    return true;
+}
+
+static bool state_ids_for_serial(const wchar_t *serial,
+                                 wchar_t *device_id, size_t device_id_cch,
+                                 wchar_t *connection_id, size_t connection_id_cch)
+{
+    wchar_t ip[64];
+    unsigned short port = 0;
+    const wchar_t *usb_serial;
+    ScrdockDeviceKind kind;
+
+    if (!serial || !serial[0] || !device_id || !connection_id) {
+        return false;
+    }
+    if (split_wifi_serial(serial, ip, _countof(ip), &port)) {
+        usb_serial = wifi_serial_of_ip(ip);
+        kind = usb_serial ? SCRDOCK_DEVICE_USB : SCRDOCK_DEVICE_WIFI;
+        if (!scrdock_make_device_id(kind, usb_serial, ip,
+                                    device_id, device_id_cch)) {
+            return false;
+        }
+        return scrdock_make_connection_id(SCRDOCK_DEVICE_WIFI, NULL, ip,
+                                          port, connection_id,
+                                          connection_id_cch);
+    }
+    return scrdock_make_device_id(SCRDOCK_DEVICE_USB, serial, NULL,
+                                  device_id, device_id_cch)
+        && scrdock_make_connection_id(SCRDOCK_DEVICE_USB, serial, NULL, 0,
+                                      connection_id, connection_id_cch);
+}
+
+static void state_session_begin_for_serial(const wchar_t *serial,
+                                           const wchar_t *command,
+                                           uint64_t started_at)
+{
+    wchar_t device_id[SCRDOCK_STATE_TEXT];
+    wchar_t connection_id[SCRDOCK_STATE_TEXT];
+    if (!state_ids_for_serial(serial, device_id, _countof(device_id),
+                              connection_id, _countof(connection_id))) {
+        return;
+    }
+    if (!scrdock_session_begin(&g.state_sessions, device_id, connection_id,
+                               command, started_at)) {
+        dbg_log(L"state: duplicate running session for %s\n", device_id);
+    }
+}
+
+static void state_session_finish_for_serial(const wchar_t *serial,
+                                            int exit_code,
+                                            uint64_t ended_at)
+{
+    wchar_t device_id[SCRDOCK_STATE_TEXT];
+    wchar_t connection_id[SCRDOCK_STATE_TEXT];
+    if (!state_ids_for_serial(serial, device_id, _countof(device_id),
+                              connection_id, _countof(connection_id))) {
+        return;
+    }
+    (void)connection_id;
+    scrdock_session_finish(&g.state_sessions, device_id, exit_code, ended_at);
 }
 
 static unsigned __stdcall meta_thread(void *arg)
@@ -4757,6 +4828,8 @@ static void ses_background_exit(int idx, DWORD code)
         s->hErr = NULL;
     }
     s->target = NULL;
+    state_session_finish_for_serial(s->serial, (int)code,
+                                   (uint64_t)GetTickCount64());
     if (code == 2 && GetTickCount64() - s->launchTick > 10000) {
         s->reconnAttempts = 0;
     }
@@ -4863,6 +4936,73 @@ static void ses_become_active(int idx)
     InvalidateRect(g.hwnd, NULL, FALSE);
 }
 
+static void state_snapshot_apply(const struct DevList *dl)
+{
+    ScrdockStateDevice items[DEV_MAX];
+    size_t count = 0;
+    int i;
+
+    if (!dl) {
+        return;
+    }
+    ZeroMemory(items, sizeof(items));
+    for (i = 0; i < dl->count && count < _countof(items); i++) {
+        const struct DevInfo *src = &dl->v[i];
+        ScrdockStateDevice *dst = &items[count];
+        wchar_t ip[64];
+        unsigned short port = 0;
+        const wchar_t *usb_serial = NULL;
+        ScrdockDeviceKind kind = SCRDOCK_DEVICE_USB;
+
+        if (split_wifi_serial(src->serial, ip, _countof(ip), &port)) {
+            kind = SCRDOCK_DEVICE_WIFI;
+            usb_serial = wifi_serial_of_ip(ip);
+        } else {
+            ip[0] = L'\0';
+            usb_serial = src->serial;
+        }
+        if (!scrdock_make_device_id(usb_serial ? SCRDOCK_DEVICE_USB : kind,
+                                    usb_serial, ip, dst->device_id,
+                                    _countof(dst->device_id))) {
+            continue;
+        }
+        if (!scrdock_make_connection_id(kind, src->serial, ip, port,
+                                        dst->connection_id,
+                                        _countof(dst->connection_id))) {
+            continue;
+        }
+        wcsncpy_s(dst->serial, _countof(dst->serial),
+                  usb_serial ? usb_serial : src->serial, _TRUNCATE);
+        wcsncpy_s(dst->ip, _countof(dst->ip), ip, _TRUNCATE);
+        dst->port = port;
+        wcsncpy_s(dst->state, _countof(dst->state), src->state, _TRUNCATE);
+        dst->online = wcscmp(src->state, L"device") == 0;
+        count++;
+    }
+    if (!scrdock_snapshot_replace(&g.state_snapshot, items, count,
+                                  false, true, 0)) {
+        dbg_log(L"state: unable to update device snapshot\n");
+    }
+}
+
+static void state_snapshot_mark_stale(unsigned error_code)
+{
+    ScrdockStateDevice items[DEV_MAX];
+    size_t count = g.state_snapshot.count;
+
+    if (count > _countof(items)) {
+        count = _countof(items);
+    }
+    if (count != 0) {
+        memcpy(items, g.state_snapshot.items,
+               count * sizeof(g.state_snapshot.items[0]));
+    }
+    if (!scrdock_snapshot_replace(&g.state_snapshot, items, count, true,
+                                  g.state_snapshot.probed, error_code)) {
+        dbg_log(L"state: unable to mark device snapshot stale\n");
+    }
+}
+
 /* UI-thread application of a fresh device snapshot (takes ownership). */
 static void devlist_apply(struct DevList *dl)
 {
@@ -4877,6 +5017,7 @@ static void devlist_apply(struct DevList *dl)
     }
     g.devList = dl;
     free(old);
+    state_snapshot_apply(dl);
 
     /* Active/reconnecting sessions keep their identity across disconnects.
      * Only an idle auto-mode toolbar selects the unique online device. */
@@ -4959,6 +5100,8 @@ static void teardown(HWND hwnd)
             ses_free(i);
         }
     }
+    scrdock_snapshot_dispose(&g.state_snapshot);
+    scrdock_session_table_dispose(&g.state_sessions);
     PostQuitMessage(0);
 }
 
@@ -5214,6 +5357,10 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         devlist_apply((struct DevList *) wp);
         return 0;
 
+    case WM_APP_DEVSTALE:
+        state_snapshot_mark_stale((unsigned)wp);
+        return 0;
+
     case WM_APP_DEVMETA:
         {
             struct DevMetaBatch *mb = (struct DevMetaBatch *) wp;
@@ -5279,6 +5426,8 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
             DWORD code = (DWORD) wp;
             err_drain(true);
+            state_session_finish_for_serial(g.serial, (int)code,
+                                           (uint64_t)GetTickCount64());
             if (code != 0) {
                 err_last_line(g.errLine, 256);
             }
@@ -5531,6 +5680,8 @@ int WINAPI wWinMain(HINSTANCE h_inst, HINSTANCE h_prev, PWSTR cmd_line,
     }
 
     get_exe_dir(g.exeDir);
+    scrdock_snapshot_init(&g.state_snapshot);
+    scrdock_session_table_init(&g.state_sessions, 20);
     ini_load();
     wifi_map_load();
 

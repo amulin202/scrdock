@@ -136,10 +136,11 @@ auto_reconnect=1
 reconnect_attempts=5
 ```
 
-以上键均可由管理窗口读写；手改 ini 与管理窗口互不冲突（保存时按"空值删键"
-原则只落非默认项）。
+以上键均可由管理窗口读写。配置文件会带有 `[meta] version=2` 标记；旧版
+`scrdock.ini` 会在启动时自动迁移，保存时先写入临时文件并原子替换，避免进程中断
+留下半份配置。`[devices]` 无线映射段会在保存时保留。
 
-注意：ini 按 ANSI 解析，值请用 ASCII（序列号/路径本来就是 ASCII）。
+配置读写使用 Unicode Win32 profile API，路径和参数不再受 ANSI 编码限制。
 
 ## 编译
 
