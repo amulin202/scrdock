@@ -40,4 +40,4 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" build/scrdock-win64-*.zip \
             --title "scrdock $GITHUB_REF_NAME" \
-            --notes "scrcpy 悬浮工具栏（纯 C / Win32 单文件）。将 scrdock.exe 放到 scrcpy 所在目录运行即可：自动拉起/附着 scrcpy，边缘贴合停靠并实时跟随，提供 Home/返回/最近任务/电源/音量/通知栏/控制中心/截图/置顶开关等按钮。"
+            --notes "scrcpy 悬浮工具栏（纯 C / Win32）。将 scrdock.exe 放到 scrcpy 所在目录运行即可：自动拉起/附着 scrcpy，边缘贴合停靠并实时跟随，提供 Home/返回/最近任务/电源/音量/通知栏/控制中心/截图/置顶开关等按钮。"
