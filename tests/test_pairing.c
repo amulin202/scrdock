@@ -65,6 +65,125 @@ static void render_qr(int side)
     DeleteDC(dc);
 }
 
+static void check_pairing_controls(bool qr_page)
+{
+    HWND qr[] = {p.qrStatus, p.qrRefresh, p.qrTip};
+    HWND manual[] = {p.lblAddr, p.edAddr, p.lblCode, p.edCode,
+                     p.go, p.out, p.manualTip};
+    for (int i = 0; i < (int)(sizeof(qr) / sizeof(qr[0])); i++) {
+        CHECK(IsWindow(qr[i]));
+        CHECK((IsWindowVisible(qr[i]) != FALSE) == qr_page);
+    }
+    for (int i = 0; i < (int)(sizeof(manual) / sizeof(manual[0])); i++) {
+        CHECK(IsWindow(manual[i]));
+        CHECK((IsWindowVisible(manual[i]) != FALSE) == !qr_page);
+    }
+}
+
+static void click_pairing_tab(int page)
+{
+    RECT tab = p.tabRc[page];
+    SendMessageW(p.frame, WM_LBUTTONDOWN, MK_LBUTTON,
+                 MAKELPARAM((tab.left + tab.right) / 2, (tab.top + tab.bottom) / 2));
+    UpdateWindow(p.frame);
+    CHECK(p.tabSel == page);
+    check_pairing_controls(page == PAIR_PAGE_QR);
+}
+
+static COLORREF pairing_pixel(POINT point)
+{
+    HDC dc = GetDC(p.frame);
+    CHECK(dc);
+    GdiFlush();
+    COLORREF pixel = GetPixel(dc, point.x, point.y);
+    ReleaseDC(p.frame, dc);
+    CHECK(pixel != CLR_INVALID);
+    return pixel;
+}
+
+static void send_pairing_event(unsigned generation, int code, const wchar_t *text)
+{
+    struct QrEvent *event = calloc(1, sizeof(*event));
+    CHECK(event);
+    event->gen = generation;
+    event->code = code;
+    wcscpy_s(event->text, 160, text);
+    SendMessageW(p.frame, WM_APP_QREVENT, 0, (LPARAM)event);
+}
+
+static void test_pairing_window(void)
+{
+    g_hInst = GetModuleHandleW(NULL);
+    g.fUi = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    m.brBg = CreateSolidBrush(RGB(32, 32, 32));
+    m.brEdit = CreateSolidBrush(RGB(43, 43, 43));
+    CHECK(m.brBg && m.brEdit);
+    HWND owner = CreateWindowExW(0, L"STATIC", L"pairing owner", WS_POPUP,
+                                 80, 80, 500, 500, NULL, NULL, g_hInst, NULL);
+    CHECK(owner);
+
+    const int stale_success_events[] = {QREV_PAIRED, QREV_CONNECTED};
+    for (int i = 0; i < (int)(sizeof(stale_success_events) / sizeof(stale_success_events[0])); i++) {
+        /* Existing credentials keep this UI test independent of ADB and devices. */
+        CHECK(qr_encode_credentials("studio-scrdock-test", "123456"));
+        p.qrGen = ++g_qrGeneration;
+        pair_open(owner);
+        HWND dialog = p.frame;
+        CHECK(IsWindow(dialog));
+        CHECK(!p.hQrThread && !p.qrStop);
+        CHECK(SetWindowPos(dialog, HWND_TOPMOST, 120, 140, 0, 0,
+                           SWP_NOSIZE | SWP_NOACTIVATE));
+        CHECK(RedrawWindow(dialog, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW));
+        check_pairing_controls(true);
+
+        /* Sample the gap between manual controls, where a stale QR would remain. */
+        RECT code, button;
+        CHECK(GetWindowRect(p.edCode, &code));
+        CHECK(GetWindowRect(p.go, &button));
+        MapWindowPoints(HWND_DESKTOP, dialog, (POINT *)&code, 2);
+        MapWindowPoints(HWND_DESKTOP, dialog, (POINT *)&button, 2);
+        POINT point = {(p.qrBox.left + p.qrBox.right) / 2,
+                       (code.bottom + button.top) / 2};
+        CHECK(PtInRect(&p.qrBox, point));
+        CHECK(code.bottom < point.y && point.y < button.top);
+        COLORREF qr_pixel = pairing_pixel(point);
+        CHECK(qr_pixel != RGB(32, 32, 32));
+        click_pairing_tab(PAIR_PAGE_MANUAL);
+        CHECK(pairing_pixel(point) == RGB(32, 32, 32));
+        click_pairing_tab(PAIR_PAGE_QR);
+        CHECK(pairing_pixel(point) == qr_pixel);
+
+        unsigned generation = p.qrGen;
+        SetWindowTextW(p.qrStatus, L"waiting");
+        send_pairing_event(generation - 1, stale_success_events[i], L"stale success");
+        CHECK(IsWindow(dialog) && IsWindow(owner));
+        wchar_t status[160];
+        GetWindowTextW(p.qrStatus, status, 160);
+        CHECK(wcscmp(status, L"waiting") == 0);
+        send_pairing_event(generation, QREV_FAILED, L"pairing failed");
+        CHECK(IsWindow(dialog) && IsWindow(owner));
+        GetWindowTextW(p.qrStatus, status, 160);
+        CHECK(wcscmp(status, L"pairing failed") == 0);
+        send_pairing_event(generation, QREV_CONNECTING, L"connecting");
+        CHECK(IsWindow(dialog) && IsWindow(owner));
+        GetWindowTextW(p.qrStatus, status, 160);
+        CHECK(wcscmp(status, L"connecting") == 0);
+        send_pairing_event(generation, QREV_PAIRED, L"paired, connection failed");
+        CHECK(IsWindow(dialog) && IsWindow(owner));
+        GetWindowTextW(p.qrStatus, status, 160);
+        CHECK(wcscmp(status, L"paired, connection failed") == 0);
+        send_pairing_event(generation, QREV_CONNECTED, L"paired and connected");
+        CHECK(!IsWindow(dialog) && !p.frame);
+        CHECK(IsWindow(owner));
+    }
+    CHECK(DestroyWindow(owner));
+    DeleteObject(m.brBg);
+    DeleteObject(m.brEdit);
+    m.brBg = m.brEdit = NULL;
+    puts("PASS pairing tabs clear QR pixels and restore controls and QR rendering");
+    puts("PASS pairing preserves stale/failure/progress/paired states and closes only after connection");
+}
+
 int wmain(int argc, wchar_t **argv)
 {
     /* ADB substitute used only by this test's worker subprocesses. */
@@ -74,6 +193,7 @@ int wmain(int argc, wchar_t **argv)
              "unrelated _adb-tls-pairing._tcp 192.0.2.20:37000\n"
              "\"studio-scrdock-test\" _adb-tls-pairing._tcp 192.0.2.15:37111\n"
              "studio-plain-test _adb-tls-pairing._tcp 192.0.2.15:37112\n"
+             "adb-stale _adb-tls-connect._tcp 192.0.2.15:38296\n"
              "adb-test _adb-tls-connect._tcp 192.0.2.15:38297");
         return 0;
     }
@@ -85,10 +205,22 @@ int wmain(int argc, wchar_t **argv)
         return 0;
     }
     if (argc == 3 && wcscmp(argv[1], L"connect") == 0) {
+        if (wcscmp(argv[2], L"192.0.2.15:38296") == 0) {
+            puts("failed to connect to 192.0.2.15:38296: Connection refused");
+            return 3;
+        }
         if (wcscmp(argv[2], L"192.0.2.15:38297")) return 3;
+        puts("adb diagnostic before connection");
         puts("connected to 192.0.2.15:38297");
         return 0;
     }
+    if (argc == 2 && wcscmp(argv[1], L"--dialog") == 0) {
+        test_pairing_window();
+        return 0;
+    }
+    CHECK(wifi_output_connected("diagnostic\r\nconnected to 192.0.2.15:38297\r\n"));
+    CHECK(wifi_output_connected("already connected to 192.0.2.15:38297\n"));
+    CHECK(!wifi_output_connected("failed: not connected to 192.0.2.15:38297\n"));
     render_qr(200);
     render_qr(300);
     render_qr(400);
@@ -131,6 +263,7 @@ int wmain(int argc, wchar_t **argv)
              : scenario == 1 ? "PASS vendor QR literal-quote argv, pairing and connection"
                              : "PASS standard QR discovery, pairing and connection");
     }
+    puts("PASS QR connection skips a stale endpoint on the same host");
     p.frame = hwnd;
     PostQuitMessage(17);
     qr_stop();
@@ -138,5 +271,6 @@ int wmain(int argc, wchar_t **argv)
     CHECK(PeekMessageW(&quit, NULL, WM_QUIT, WM_QUIT, PM_REMOVE) && quit.wParam == 17);
     DestroyWindow(hwnd);
     puts("PASS QR rendering at three scales and quit-message preservation");
+    test_pairing_window();
     return 0;
 }

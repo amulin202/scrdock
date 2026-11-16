@@ -3288,6 +3288,17 @@ static void wifi_append(struct WifiResult *r, const wchar_t *text)
     wcsncat_s(r->text, 256, text, _TRUNCATE);
 }
 
+static bool wifi_output_connected(const char *output)
+{
+    for (const char *line = output; line && *line;) {
+        if (strncmp(line, "connected to ", 13) == 0
+                || strncmp(line, "already connected to ", 21) == 0) return true;
+        line = strchr(line, '\n');
+        if (line) line++;
+    }
+    return false;
+}
+
 /* mDNS advertises endpoints, not pairing trust. adb connect checks trust. */
 static void mdns_discover_and_connect(struct WifiResult *r)
 {
@@ -3319,9 +3330,7 @@ static void mdns_discover_and_connect(struct WifiResult *r)
     swprintf(ccmd, MAX_PATH + 200, L"\"%s\" connect %s", g.adbPath, addrs[0]);
     int captured = capture_sync(ccmd, output, sizeof(output), 15000, &ec);
     /* Some adb versions report connection failures with exit status zero. */
-    int connected = captured && ec == 0
-        && (strncmp(output, "connected to ", 13) == 0
-            || strncmp(output, "already connected to ", 21) == 0);
+    int connected = captured && ec == 0 && wifi_output_connected(output);
     wifi_append(r, connected ? L"\r\n已连接 " : L"\r\n自动连接失败，请核对配对状态及地址：");
     wifi_append(r, addrs[0]);
 }
@@ -3505,7 +3514,8 @@ enum {
     QREV_PAIRING = 2,
     QREV_PAIRED = 3,
     QREV_CONNECTED = 4,
-    QREV_FAILED = 5
+    QREV_FAILED = 5,
+    QREV_CONNECTING = 6
 };
 
 struct QrWork {
@@ -3669,7 +3679,7 @@ static unsigned __stdcall qr_pair_thread(void *arg)
         goto done;
     }
 
-    qr_post_event(w, QREV_PAIRED, L"配对成功！正在自动发现并连接…");
+    qr_post_event(w, QREV_CONNECTING, L"配对成功！正在自动发现并连接…");
 
     /* 稍等 1.5 秒让手机端 _adb-tls-connect 服务就绪 */
     if (WaitForSingleObject(w->stop, 1500) == WAIT_OBJECT_0) goto done;
@@ -3680,45 +3690,55 @@ static unsigned __stdcall qr_pair_thread(void *arg)
     wchar_t *col = wcsrchr(pair_ip, L':');
     if (col) *col = L'\0';
 
-    /* 寻找 _adb-tls-connect 服务自动连接 */
+    /* Discovery may contain stale ports for this phone. Try each matching
+     * endpoint and rediscover after failures, keeping connection work bounded. */
     wchar_t conn_addr[80] = { 0 };
-    for (int i = 0; i < 12; i++) {
+    bool connected = false;
+    int connect_attempts = 0;
+    for (int i = 0; i < 12 && connect_attempts < 6; i++) {
         if (WaitForSingleObject(w->stop, 0) == WAIT_OBJECT_0) goto done;
         DWORD ec2 = 1;
         if (capture_sync_cancel(cmd, buf, sizeof(buf), 6000, &ec2, w->stop) && ec2 == 0) {
             struct MdnsItem items[16];
             int n_items = mdns_parse_items(buf, items, 16);
-            for (int j = 0; j < n_items; j++) {
-                if (strncmp(items[j].type, "_adb-tls-connect", 16) == 0) {
-                    if (mdns_same_host(items[j].addr, pair_addr)) {
-                        wcsncpy_s(conn_addr, 80, items[j].addr, _TRUNCATE);
+            for (int j = 0; j < n_items && connect_attempts < 6; j++) {
+                if (strncmp(items[j].type, "_adb-tls-connect", 16) != 0
+                        || !mdns_same_host(items[j].addr, pair_addr)) continue;
+                bool duplicate = false;
+                for (int k = 0; k < j; k++) {
+                    if (wcscmp(items[k].addr, items[j].addr) == 0
+                            && strncmp(items[k].type, "_adb-tls-connect", 16) == 0) {
+                        duplicate = true;
                         break;
                     }
                 }
-            }
-            if (conn_addr[0]) {
-                break;
+                if (duplicate) continue;
+                wcsncpy_s(conn_addr, 80, items[j].addr, _TRUNCATE);
+                swprintf(msg, 160, L"配对成功，正在连接 %s…", conn_addr);
+                qr_post_event(w, QREV_CONNECTING, msg);
+
+                wchar_t ccmd[MAX_PATH + 160];
+                char cout[512] = { 0 };
+                DWORD ec3 = 1;
+                swprintf(ccmd, MAX_PATH + 160, L"\"%s\" connect %s", w->adb, conn_addr);
+                connect_attempts++;
+                bool captured = capture_sync_cancel(ccmd, cout, sizeof(cout), 5000, &ec3, w->stop);
+                connected = captured && ec3 == 0 && wifi_output_connected(cout);
+                if (connected) break;
             }
         }
+        if (connected || connect_attempts >= 6) break;
         if (WaitForSingleObject(w->stop, 1000) == WAIT_OBJECT_0) goto done;
     }
 
-    if (conn_addr[0]) {
-        wchar_t ccmd[MAX_PATH + 160];
-        char cout[512] = { 0 };
-        DWORD ec3 = 1;
-        swprintf(ccmd, MAX_PATH + 160, L"\"%s\" connect %s", w->adb, conn_addr);
-        bool connected = capture_sync_cancel(ccmd, cout, sizeof(cout), 15000, &ec3, w->stop);
-        if (connected && ec3 == 0
-                && (strstr(cout, "connected to") || strstr(cout, "already connected"))) {
-            swprintf(msg, 160, L"配对并连接成功！(%s)", conn_addr);
-            qr_post_event(w, QREV_CONNECTED, msg);
-        } else {
-            swprintf(msg, 160, L"配对成功！请在设备列表中连接 %s", conn_addr);
-            qr_post_event(w, QREV_PAIRED, msg);
-        }
+    if (connected) {
+        swprintf(msg, 160, L"配对并连接成功！(%s)", conn_addr);
+        qr_post_event(w, QREV_CONNECTED, msg);
+    } else if (conn_addr[0]) {
+        swprintf(msg, 160, L"配对成功，但连接 %s 失败\n请核对手机无线调试的连接端口后重试", conn_addr);
+        qr_post_event(w, QREV_PAIRED, msg);
     } else {
-        swprintf(msg, 160, L"配对成功！端点为 %s，请在设备列表中连接", pair_ip[0] ? pair_ip : L"手机");
+        swprintf(msg, 160, L"配对成功，但未发现 %s 的连接服务\n请在管理页按手机显示的 IP 和端口连接", pair_ip[0] ? pair_ip : L"手机");
         qr_post_event(w, QREV_PAIRED, msg);
     }
 
@@ -3834,7 +3854,7 @@ static void pair_show_page(int page)
         qr_generate();
     }
     if (p.frame && IsWindow(p.frame)) {
-        InvalidateRect(p.frame, NULL, FALSE);
+        InvalidateRect(p.frame, NULL, TRUE);
     }
 }
 
@@ -4067,6 +4087,10 @@ static LRESULT CALLBACK pair_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 if (event->code == QREV_CONNECTED || event->code == QREV_PAIRED) {
                     meta_spawn();
                     mgr_refresh();
+                    if (m.status && IsWindow(m.status)) {
+                        SetWindowTextW(m.status, event->text);
+                    }
+                    if (event->code == QREV_CONNECTED) DestroyWindow(hwnd);
                 }
             }
             free(event);
@@ -4140,7 +4164,7 @@ static void pair_open(HWND owner)
     p.qrRefresh = mkctl(f, L"BUTTON", WS_TABSTOP,
                         L"重新生成二维码", 145, 348, 150, MG_BTN_H_96, MID_PAIR_QR_REFRESH, dpi);
     p.qrTip = mkctl(f, L"STATIC", SS_NOPREFIX | SS_CENTER,
-                    L"支持 Android 11 及以上（含 Android 15）。\n请使用无线调试扫码，勿用相机或微信。\n手机与电脑需在同一局域网。",
+                    L"支持 Android 11 及以上。\n请使用无线调试扫码，勿用相机或微信。\n手机与电脑需在同一局域网。",
                     16, 390, 408, 60, 0, dpi);
 
     /* 手动配对控件 */
